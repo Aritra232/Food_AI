@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai
+pymongo
+python-dotenv
+pinecone
+streamlit
+requests

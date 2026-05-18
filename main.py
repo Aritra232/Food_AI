@@ -26,6 +26,9 @@ from service.recommendation_response_service import (
     format_options
 )
 
+from service.embedding_service import generate_embedding
+from service.pinecone_service import upsert_vectors, query_vector
+
 from service.intent_service import detect_intent
 
 from service.state_service import get_state, set_state
@@ -43,7 +46,7 @@ from service.option_memory_service import (
 
 from service.cart_service import add_to_cart, get_cart
 
-from service.database_service import menu_collection
+from service.database_service import menu_collection, restaurant_collection
 from service.restaurant_service import get_location_based_menus
 from bson import ObjectId
 
@@ -183,6 +186,114 @@ def ai_recommend(user_id: str, food: str):
         "recommendations": recommendations,
         "ai_response": ai_response
     }
+
+
+
+@app.post("/sync-pinecone")
+def sync_pinecone():
+    """Sync menus and restaurants into Pinecone index."""
+    # load latest menus and restaurants from Mongo
+    menus = list(menu_collection.find({}))
+    vectors = []
+
+    for m in menus:
+        _id = str(m.get("_id"))
+        text = f"{m.get('food_name', '')} {m.get('description', '')} {' '.join(m.get('tags', []))} {m.get('ingredients', '')}"
+        vec = generate_embedding(text)
+        metadata = {
+            "menu_id": m.get('menu_id'),
+            "restaurant_id": m.get('restaurant_id'),
+            "price": m.get('price'),
+            "cuisine": m.get('cuisine'),
+            "available": m.get('available', True),
+            "tags": m.get('tags', [])
+        }
+        vectors.append((_id, vec, metadata))
+
+    # upsert menus
+    upsert_vectors(vectors)
+
+    # restaurants
+    restaurants = list(restaurant_collection.find({}))
+    rvecs = []
+    for r in restaurants:
+        _id = str(r.get("_id"))
+        text = f"{r.get('name', '')} {r.get('description', '')} {' '.join(r.get('cuisines', []))}"
+        vec = generate_embedding(text)
+        location = r.get('location') or {}
+        location_lat = None
+        location_lng = None
+
+        if isinstance(location, dict):
+            location_lat = location.get('lat') or location.get('latitude')
+            location_lng = location.get('lng') or location.get('longitude')
+
+        metadata = {
+            "restaurant_id": r.get('restaurant_id'),
+            "name": r.get('name'),
+            "cuisines": r.get('cuisines', []),
+            "location_lat": location_lat,
+            "location_lng": location_lng
+        }
+        rvecs.append((_id, vec, metadata))
+
+    upsert_vectors(rvecs)
+
+    return {"message": "synced", "menus_indexed": len(vectors), "restaurants_indexed": len(rvecs)}
+
+
+@app.get("/hybrid-search")
+def hybrid_search(query: str, top_k: int = 5, cuisine: str = None, max_price: float = None):
+    """Run a hybrid vector + metadata search and return Mongo documents.
+
+    Filters: `cuisine`, `max_price` applied via metadata filters.
+    """
+    embed = generate_embedding(query)
+
+    # Build metadata filter
+    filt = {}
+    if cuisine:
+        filt["cuisine"] = {"$eq": cuisine}
+    if max_price is not None:
+        # pinecone supports numeric metadata filters; here we use <=
+        filt["price"] = {"$lte": float(max_price)}
+
+    res = query_vector(embed, top_k=top_k, filter=filt)
+
+    # Extract ids from results
+    matches = []
+    try:
+        for match in (res.matches if hasattr(res, 'matches') else res['matches']):
+            mid = match.id if hasattr(match, 'id') else match['id']
+            meta = match.metadata if hasattr(match, 'metadata') else match.get('metadata', {})
+            matches.append({"id": mid, "score": getattr(match, 'score', match.get('score')), "metadata": meta})
+    except Exception:
+        # fallback for other response shapes
+        for m in res:
+            matches.append(m)
+
+    # Fetch authoritative records from Mongo for menus
+    menu_ids = [m['id'] for m in matches]
+    docs = []
+    if menu_ids:
+        from bson import ObjectId
+        for mid in menu_ids:
+            try:
+                doc = menu_collection.find_one({"_id": ObjectId(mid)})
+                if doc:
+                    doc['_id'] = str(doc['_id'])
+                    docs.append(doc)
+            except Exception:
+                # maybe it's a restaurant id
+                try:
+                    doc = restaurant_collection.find_one({"_id": ObjectId(mid)})
+                    if doc:
+                        doc['_id'] = str(doc['_id'])
+                        docs.append(doc)
+                except Exception:
+                    pass
+
+    return {"query": query, "matches": matches, "documents": docs}
 
 
 

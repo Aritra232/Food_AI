@@ -35,15 +35,28 @@ def get_nearby_restaurants(user_lat, user_lng, max_distance_km=10):
 
     for r in restaurants:
 
-        if "lat" not in r or "lng" not in r:
+        lat = None
+        lng = None
+
+        # Support both legacy top-level lat/lng and nested location.lat/lng
+        if "lat" in r and "lng" in r:
+            lat = r.get("lat")
+            lng = r.get("lng")
+        else:
+            location = r.get("location") or {}
+            if isinstance(location, dict):
+                lat = location.get("lat") or location.get("latitude")
+                lng = location.get("lng") or location.get("longitude")
+
+        if lat is None or lng is None:
             continue
 
         try:
             distance = calculate_distance(
                 float(user_lat),
                 float(user_lng),
-                float(r["lat"]),
-                float(r["lng"])
+                float(lat),
+                float(lng)
             )
         except:
             continue

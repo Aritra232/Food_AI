@@ -354,7 +354,14 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 message
             )
 
-        # STRICT NO FALLBACK
+        if not recommendations or len(recommendations) == 0:
+
+            # Fallback to global recommendation search so Pinecone + Mongo can still return options
+            recommendations = recommend_foods(
+                user_id,
+                message
+            )
+
         if not recommendations or len(recommendations) == 0:
 
             error_msg = "Sorry, no matching food is available in nearby restaurants."
@@ -365,7 +372,6 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 "state": "browsing",
                 "message": error_msg
             }
-
         # CREATE OPTIONS
         options_text, options_map = format_options(
             recommendations

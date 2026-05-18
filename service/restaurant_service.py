@@ -6,7 +6,7 @@ from service.database_service import (
 )
 
 from service.embedding_service import generate_embedding
-from service.pinecone_service import index
+from service.pinecone_service import upsert_vectors, query_vector
 from service.location_service import get_nearby_restaurants
 
 
@@ -20,6 +20,20 @@ def add_restaurant(data):
         data["lat"] = float(data["lat"])
     if "lng" in data:
         data["lng"] = float(data["lng"])
+
+    # also support a nested location object and mirror values for compatibility
+    location = data.get("location")
+    if isinstance(location, dict):
+        if "lat" in location and "lat" not in data:
+            data["lat"] = float(location["lat"])
+        if "lng" in location and "lng" not in data:
+            data["lng"] = float(location["lng"])
+
+    if "lat" in data and "lng" in data and "location" not in data:
+        data["location"] = {
+            "lat": data["lat"],
+            "lng": data["lng"]
+        }
 
     restaurant_collection.insert_one(data)
 
@@ -41,18 +55,16 @@ def add_menu_item(data):
 
     embedding = generate_embedding(searchable_text)
 
-    index.upsert(
-        vectors=[
-            (
-                data["menu_id"],
-                embedding,
-                {
-                    "food_name": data["food_name"],
-                    "restaurant_id": data["restaurant_id"]
-                }
-            )
-        ]
-    )
+    upsert_vectors([
+        (
+            data["menu_id"],
+            embedding,
+            {
+                "food_name": data["food_name"],
+                "restaurant_id": data["restaurant_id"]
+            }
+        )
+    ])
 
 
 # -------------------------
@@ -76,22 +88,21 @@ def semantic_food_search(query):
 
     query_embedding = generate_embedding(query)
 
-    results = index.query(
-        vector=query_embedding,
-        top_k=5,
-        include_metadata=True
-    )
+    res = query_vector(query_embedding, top_k=5, filter=None)
 
-    return {
-        "matches": [
-            {
-                "id": m["id"],
-                "score": m["score"],
-                "metadata": m.get("metadata", {})
-            }
-            for m in results.get("matches", [])
-        ]
-    }
+    matches = []
+    try:
+        candidate_list = res.matches if hasattr(res, 'matches') else res.get('matches', [])
+    except Exception:
+        candidate_list = res.get('matches', []) if isinstance(res, dict) else []
+
+    for m in candidate_list:
+        mid = m.id if hasattr(m, 'id') else m.get('id')
+        score = getattr(m, 'score', m.get('score'))
+        meta = m.metadata if hasattr(m, 'metadata') else m.get('metadata', {})
+        matches.append({"id": mid, "score": score, "metadata": meta})
+
+    return {"matches": matches}
 
 
 # -------------------------

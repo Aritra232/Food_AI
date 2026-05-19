@@ -130,15 +130,16 @@ def _send_chat_message(message_text):
         st.session_state.last_assistant_response = assistant_text
 
     recommendations = result.get("recommendations") or []
+    show_instruction_card = bool(result.get("show_instruction_card"))
 
-    if result.get("show_instruction_card"):
+    if show_instruction_card:
         st.session_state.awaiting_instruction_prompt = True
         st.session_state.instruction_input_open = False
         st.session_state.pending_instruction_restaurant_id = result.get("restaurant_id")
         st.session_state.current_recommendations = []
 
-    # Always show returned recommendations (don't auto-hide desserts)
-    if recommendations:
+    # Only show recommendations when we are not switching into instruction mode
+    if recommendations and not show_instruction_card:
         st.session_state.current_recommendations = recommendations[:5]
         st.session_state.option_quantities = {
             chr(65 + i): 1
@@ -289,11 +290,6 @@ with tab1:
         except Exception as e:
             st.error(f"Error: {str(e)}")
 
-    _render_recommendations()
-
-    if st.session_state.selected_option_text:
-        st.info(f"Selected command copied to input: {st.session_state.selected_option_text}")
-
     # If the backend asked for a special instruction, show the prompt card
     if st.session_state.get('awaiting_instruction_prompt'):
         st.markdown("---")
@@ -345,6 +341,11 @@ with tab1:
                         st.error(f"Failed to save instruction: {resp.status_code}")
                 except Exception as e:
                     st.error(f"Error saving instruction: {str(e)}")
+
+    _render_recommendations()
+
+    if st.session_state.selected_option_text:
+        st.info(f"Selected command copied to input: {st.session_state.selected_option_text}")
 
 # ==================== PROFILE TAB ====================
 with tab2:

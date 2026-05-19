@@ -96,6 +96,20 @@ def _is_no_thanks_message(message):
     return text in {"no thanks", "no thank you", "no, thanks", "no", "skip"}
 
 
+def _looks_like_dessert_item(item):
+    text = " ".join([
+        str(item.get("food_name", "")),
+        str(item.get("category", "")),
+        " ".join(item.get("tags", []) if isinstance(item.get("tags", []), list) else []),
+    ]).lower()
+    dessert_terms = [
+        "dessert", "ice cream", "icecream", "kulfi", "cake", "pie",
+        "mousse", "cheesecake", "gulab jamun", "gulab", "jamun", "sundae",
+        "pudding", "sweet", "brownie", "pastry", "gelato", "falooda"
+    ]
+    return any(term in text for term in dessert_terms)
+
+
 def _build_blocked_ingredient_reply(message, blocked_items):
     if not blocked_items:
         return "I do not have recent blocked items to explain yet."
@@ -647,6 +661,23 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 cart = get_cart(user_id)
                 success_msg = "Item added to cart successfully"
 
+                # If the selected item itself is a dessert, do not show more dessert recommendations.
+                # Open the instruction card immediately instead.
+                if _looks_like_dessert_item(selected_item):
+                    restaurant_id = selected_item.get("restaurant_id")
+                    save_last_instruction_context(user_id, restaurant_id)
+
+                    add_message(user_id, "assistant", success_msg)
+
+                    return {
+                        "intent": intent,
+                        "state": "cart",
+                        "message": success_msg,
+                        "cart": cart,
+                        "show_instruction_card": True,
+                        "restaurant_id": restaurant_id
+                    }
+
                 # After adding to cart, proactively suggest desserts / cold items
                 try:
                     restaurant_id = selected_item.get("restaurant_id")
@@ -699,7 +730,8 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                             "message": full_msg,
                             "cart": cart,
                             "recommendations": dessert_recs,
-                            "ai_response": ai_reco
+                            "ai_response": ai_reco,
+                            "restaurant_id": restaurant_id
                         }
 
                     # if no restaurant-specific desserts found, do not auto-suggest others by default

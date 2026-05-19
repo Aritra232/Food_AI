@@ -3,14 +3,18 @@ from service.database_service import db
 option_collection = db["user_options"]
 
 
-def save_options(user_id, options_dict):
+def save_options(user_id, options_dict, original_query=None):
+
+    payload = {
+        "options": options_dict
+    }
+    if original_query:
+        payload["last_query"] = original_query
 
     option_collection.update_one(
         {"user_id": user_id},
         {
-            "$set": {
-                "options": options_dict
-            }
+            "$set": payload
         },
         upsert=True
     )
@@ -51,6 +55,14 @@ def get_options(user_id):
         return {}
 
     return data.get("options", {})
+
+
+def get_last_saved_query(user_id):
+
+    data = option_collection.find_one({"user_id": user_id})
+    if not data:
+        return None
+    return data.get("last_query")
 
 
 def save_last_blocked_items(user_id, blocked_items):

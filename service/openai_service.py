@@ -91,4 +91,7 @@ def chat_with_ai(user_id, user_message):
 
     add_message(user_id, "assistant", ai_response)
 
-    return ai_response
+    return {
+        "response": ai_response,
+        "extracted_preferences": extracted_preferences
+    }

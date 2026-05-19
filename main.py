@@ -1,5 +1,4 @@
 import re
-import re
 from fastapi import FastAPI
 
 # Services
@@ -16,11 +15,11 @@ from service.restaurant_service import (
     add_restaurant,
     add_menu_item,
     search_food,
-    semantic_food_search
+    semantic_food_search,
+    get_location_based_menus
 )
 
-from service.recommendation_service import recommend_foods
-from service.recommendation_service import filter_allergy_safe_foods
+from service.recommendation_service import recommend_foods, filter_allergy_safe_foods
 
 from service.recommendation_response_service import (
     generate_recommendation_response,
@@ -31,9 +30,7 @@ from service.embedding_service import generate_embedding
 from service.pinecone_service import upsert_vectors, query_vector
 
 from service.intent_service import detect_intent
-
 from service.state_service import get_state, set_state
-
 from service.memory_service import get_conversation, add_message
 
 from service.preference_extraction_service import extract_preferences
@@ -44,21 +41,21 @@ from service.option_memory_service import (
     save_selected_item,
     get_selected_item,
     save_last_blocked_items,
-    get_last_blocked_items
+    get_last_blocked_items,
+    get_last_saved_query
 )
 
 from service.cart_service import add_to_cart, get_cart
 
 from service.database_service import menu_collection, restaurant_collection
-from service.restaurant_service import get_location_based_menus
 from bson import ObjectId
 
 from service.order_service import (
     add_item,
     remove_item,
-    get_or_create_cart
+    get_or_create_cart,
+    calculate_total
 )
-from service.order_service import calculate_total
 
 app = FastAPI()
 
@@ -383,6 +380,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
     # CASE 4: NORMAL CHAT
     # -------------------------
     if intent == "chat":
+        # ingredient follow-up: user asking which ingredient/allergen
         if _is_ingredient_question(message):
             blocked_items = get_last_blocked_items(user_id)
             ingredient_reply = _build_blocked_ingredient_reply(message, blocked_items)
@@ -395,13 +393,42 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 "message": ingredient_reply
             }
 
-        ai_response = chat_with_ai(user_id, message)
+        # regular chat: get AI reply and detect any extracted preference updates
+        ai_result = chat_with_ai(user_id, message)
+        ai_response = ai_result.get("response") if isinstance(ai_result, dict) else ai_result
+        extracted = ai_result.get("extracted_preferences") if isinstance(ai_result, dict) else {}
+
+        # If the user just updated allergies, attempt to auto-refresh last saved recommendations
+        refreshed_recommendations = None
+        try:
+            if extracted and extracted.get("allergies"):
+                from service.option_memory_service import get_last_saved_query
+
+                last_query = get_last_saved_query(user_id)
+                if last_query:
+                    refreshed_recommendations = recommend_foods(user_id, last_query)
+                    # persist options for UI selection after auto-refresh
+                    try:
+                        options_text, options_map = format_options(refreshed_recommendations)
+                        save_options(user_id, options_map, original_query=last_query)
+                        save_last_blocked_items(user_id, [])
+                    except Exception:
+                        pass
+        except Exception:
+            refreshed_recommendations = None
+
         set_state(user_id, "chat")
-        return {
+
+        resp = {
             "intent": intent,
             "state": "chat",
             "message": ai_response
         }
+
+        if refreshed_recommendations:
+            resp["recommendations"] = refreshed_recommendations
+
+        return resp
 
     # Save user message to conversation history for order/select/checkout flow
     add_message(user_id, "user", message)
@@ -477,10 +504,11 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             recommendations
         )
 
-        # SAVE OPTIONS
+        # SAVE OPTIONS (store original query to allow auto-refresh later)
         save_options(
             user_id,
-            options_map
+            options_map,
+            original_query=message
         )
 
         # AI RESPONSE
@@ -586,8 +614,65 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 set_state(user_id, "cart")
 
                 cart = get_cart(user_id)
-
                 success_msg = "Item added to cart successfully"
+
+                # After adding to cart, proactively suggest desserts / cold items
+                try:
+                    restaurant_id = selected_item.get("restaurant_id")
+
+                    # prefer desserts from the same restaurant only
+                    regex_names = r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|dessert"
+                    cursor = menu_collection.find({
+                        "restaurant_id": restaurant_id,
+                        "available": True,
+                        "$or": [
+                            {"category": {"$regex": "dessert", "$options": "i"}},
+                            {"tags": {"$elemMatch": {"$regex": "dessert", "$options": "i"}}},
+                            {"food_name": {"$regex": regex_names, "$options": "i"}}
+                        ]
+                    }).limit(10)
+
+                    dessert_items = []
+                    for d in cursor:
+                        # convert ObjectId fields to strings for JSON safety
+                        try:
+                            if d.get("_id") is not None:
+                                d["_id"] = str(d["_id"])
+                        except Exception:
+                            pass
+                        dessert_items.append(d)
+
+                    # only show restaurant-specific desserts by default
+                    if dessert_items:
+                        # prepare AI recommendation text for desserts
+                        dessert_recs = dessert_items[:5]
+                        ai_reco = generate_recommendation_response("Here are some desserts and cold items from the same restaurant:", dessert_recs)
+
+                        # persist options so UI reflects new choices
+                        try:
+                            _, options_map = format_options(dessert_recs)
+                            save_options(user_id, options_map, original_query=f"dessert_suggestion:{restaurant_id}")
+                            save_last_blocked_items(user_id, [])
+                        except Exception:
+                            pass
+
+                        full_msg = f"{success_msg}\n\n{ai_reco['response']}"
+                        add_message(user_id, "assistant", full_msg)
+
+                        return {
+                            "intent": intent,
+                            "state": "cart",
+                            "message": full_msg,
+                            "cart": cart,
+                            "recommendations": dessert_recs,
+                            "ai_response": ai_reco
+                        }
+
+                    # if no restaurant-specific desserts found, do not auto-suggest others by default
+                except Exception:
+                    # fallback: still return success message
+                    pass
+
                 add_message(user_id, "assistant", success_msg)
 
                 return {

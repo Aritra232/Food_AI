@@ -42,10 +42,13 @@ from service.option_memory_service import (
     get_selected_item,
     save_last_blocked_items,
     get_last_blocked_items,
-    get_last_saved_query
+    get_last_saved_query,
+    save_last_instruction_context,
+    get_last_instruction_context
 )
 
 from service.cart_service import add_to_cart, get_cart
+from service.cart_service import update_item_instruction
 
 from service.database_service import menu_collection, restaurant_collection
 from bson import ObjectId
@@ -86,6 +89,11 @@ def _is_ingredient_question(message):
         ("which" in text or "what" in text)
         and ("ingredient" in text or "allergen" in text)
     )
+
+
+def _is_no_thanks_message(message):
+    text = (message or "").strip().lower()
+    return text in {"no thanks", "no thank you", "no, thanks", "no", "skip"}
 
 
 def _build_blocked_ingredient_reply(message, blocked_items):
@@ -393,6 +401,26 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 "message": ingredient_reply
             }
 
+        # dessert follow-up: user says "No thanks" to prompt the instruction card
+        if _is_no_thanks_message(message):
+            restaurant_id = get_last_instruction_context(user_id)
+            if restaurant_id:
+                prompt_msg = (
+                    "Add any special requests or dietary notes below to customize your order!"
+                )
+
+                add_message(user_id, "user", message)
+                add_message(user_id, "assistant", prompt_msg)
+                set_state(user_id, "instruction_prompt")
+
+                return {
+                    "intent": intent,
+                    "state": "instruction_prompt",
+                    "message": prompt_msg,
+                    "show_instruction_card": True,
+                    "restaurant_id": restaurant_id
+                }
+
         # regular chat: get AI reply and detect any extracted preference updates
         ai_result = chat_with_ai(user_id, message)
         ai_response = ai_result.get("response") if isinstance(ai_result, dict) else ai_result
@@ -429,6 +457,9 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             resp["recommendations"] = refreshed_recommendations
 
         return resp
+
+
+    
 
     # Save user message to conversation history for order/select/checkout flow
     add_message(user_id, "user", message)
@@ -648,6 +679,9 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                         dessert_recs = dessert_items[:5]
                         ai_reco = generate_recommendation_response("Here are some desserts and cold items from the same restaurant:", dessert_recs)
 
+                        # remember the restaurant context so a later "No thanks" can open the instruction card
+                        save_last_instruction_context(user_id, restaurant_id)
+
                         # persist options so UI reflects new choices
                         try:
                             _, options_map = format_options(dessert_recs)
@@ -738,3 +772,19 @@ def view_cart(user_id: str):
         "cart": cart,
         "total_price": total_price
     }
+
+
+@app.post("/instruction")
+def add_instruction(user_id: str, instruction: str, restaurant_id: str = None):
+    """Save a cart-level special instruction for the user's cart.
+
+    This endpoint always stores instructions at the cart document level (`cart.special_instructions`).
+    """
+    from service.cart_service import set_cart_instruction
+
+    if restaurant_id is None:
+        restaurant_id = get_last_instruction_context(user_id)
+
+    set_cart_instruction(user_id, instruction, restaurant_id=restaurant_id)
+    add_message(user_id, "assistant", "Saved cart-level instruction.")
+    return {"status": "ok", "target": "cart_level"}

@@ -88,3 +88,28 @@ def get_last_blocked_items(user_id):
         return []
 
     return data.get("last_blocked_items", [])
+
+
+def save_last_instruction_context(user_id, restaurant_id=None):
+
+    option_collection.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "last_instruction_restaurant_id": restaurant_id
+            }
+        },
+        upsert=True
+    )
+
+
+def get_last_instruction_context(user_id):
+
+    data = option_collection.find_one(
+        {"user_id": user_id}
+    )
+
+    if not data:
+        return None
+
+    return data.get("last_instruction_restaurant_id")

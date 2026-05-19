@@ -70,6 +70,12 @@ if "last_assistant_response" not in st.session_state:
     st.session_state.last_assistant_response = ""
 if "current_recommendations" not in st.session_state:
     st.session_state.current_recommendations = []
+if "awaiting_instruction_prompt" not in st.session_state:
+    st.session_state.awaiting_instruction_prompt = False
+if "instruction_input_open" not in st.session_state:
+    st.session_state.instruction_input_open = False
+if "pending_instruction_restaurant_id" not in st.session_state:
+    st.session_state.pending_instruction_restaurant_id = None
 
 
 def _extract_assistant_text(result):
@@ -124,6 +130,14 @@ def _send_chat_message(message_text):
         st.session_state.last_assistant_response = assistant_text
 
     recommendations = result.get("recommendations") or []
+
+    if result.get("show_instruction_card"):
+        st.session_state.awaiting_instruction_prompt = True
+        st.session_state.instruction_input_open = False
+        st.session_state.pending_instruction_restaurant_id = result.get("restaurant_id")
+        st.session_state.current_recommendations = []
+
+    # Always show returned recommendations (don't auto-hide desserts)
     if recommendations:
         st.session_state.current_recommendations = recommendations[:5]
         st.session_state.option_quantities = {
@@ -187,6 +201,7 @@ def _render_recommendations():
                         st.error(confirm_error)
                     else:
                         st.rerun()
+
 
 # Main title
 st.title("🍔 Food AI Chatbot")
@@ -279,6 +294,58 @@ with tab1:
     if st.session_state.selected_option_text:
         st.info(f"Selected command copied to input: {st.session_state.selected_option_text}")
 
+    # If the backend asked for a special instruction, show the prompt card
+    if st.session_state.get('awaiting_instruction_prompt'):
+        st.markdown("---")
+        st.markdown(
+            """
+            <div style="background:#ffffff;border-radius:24px;padding:24px;border:1px solid #f1f1f1;box-shadow:0 10px 30px rgba(0,0,0,0.04);">
+                <div style="font-size:20px;font-weight:700;color:#1f2937;margin-bottom:12px;">Special instructions</div>
+                <div style="font-size:15px;line-height:1.6;color:#6b7280;margin-bottom:18px;">
+                    Please let us know if you are allergic to anything or if we need to avoid anything
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        col_skip, col_input = st.columns([1, 2])
+        if col_skip.button("Skip", use_container_width=True):
+            st.session_state.awaiting_instruction_prompt = False
+            st.session_state.instruction_input_open = False
+            st.session_state.pending_instruction_restaurant_id = None
+            st.rerun()
+
+        if col_input.button("Input Instruction", use_container_width=True):
+            st.session_state.instruction_input_open = True
+            st.rerun()
+
+        if st.session_state.get("instruction_input_open"):
+            instruction_text = st.text_input(
+                "Add any special requests or dietary notes below",
+                key="pending_order_instr"
+            )
+            if st.button("Save Instruction", use_container_width=True):
+                try:
+                    resp = requests.post(
+                        f"{API_BASE_URL}/instruction",
+                        params={
+                            "user_id": user_id,
+                            "instruction": instruction_text,
+                            "restaurant_id": st.session_state.get("pending_instruction_restaurant_id")
+                        }
+                    )
+                    if resp.status_code == 200:
+                        st.success("Instruction saved to cart.")
+                        st.session_state.awaiting_instruction_prompt = False
+                        st.session_state.instruction_input_open = False
+                        st.session_state.pending_instruction_restaurant_id = None
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to save instruction: {resp.status_code}")
+                except Exception as e:
+                    st.error(f"Error saving instruction: {str(e)}")
+
 # ==================== PROFILE TAB ====================
 with tab2:
     st.subheader("👤 User Profile")
@@ -323,7 +390,7 @@ with tab2:
 # ==================== CART TAB ====================
 with tab3:
     st.subheader("🛒 Shopping Cart")
-    
+
     if st.button("Refresh Cart"):
         try:
             response = requests.get(f"{API_BASE_URL}/cart", params={"user_id": user_id})
@@ -356,6 +423,10 @@ with tab3:
                             st.write(f"**Menu ID:** {item.get('menu_id')}")
                         with col3:
                             st.write(f"**Restaurant:** {item.get('restaurant_id')}")
+                        # Show existing item-level instruction (read-only)
+                        existing_instr = item.get('special_instructions')
+                        if existing_instr:
+                            st.write(f"**Item instruction:** {existing_instr}")
                 
                 st.markdown("---")
                 st.markdown(f"### 💰 Total: ₹{total}")

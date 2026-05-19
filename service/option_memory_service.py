@@ -51,3 +51,28 @@ def get_options(user_id):
         return {}
 
     return data.get("options", {})
+
+
+def save_last_blocked_items(user_id, blocked_items):
+
+    option_collection.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "last_blocked_items": blocked_items or []
+            }
+        },
+        upsert=True
+    )
+
+
+def get_last_blocked_items(user_id):
+
+    data = option_collection.find_one(
+        {"user_id": user_id}
+    )
+
+    if not data:
+        return []
+
+    return data.get("last_blocked_items", [])

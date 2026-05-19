@@ -55,6 +55,20 @@ def _extract_allergy_terms(values):
     return allergies
 
 
+def _merge_unique_case_insensitive(items):
+    merged = []
+    seen = set()
+
+    for item in _normalize_list(items):
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+
+    return merged
+
+
 def create_user_profile_if_not_exists(user_id):
 
     existing_user = user_profile_collection.find_one({
@@ -154,8 +168,7 @@ def update_user_preferences(user_id, extracted_data):
     allergy_like_dislikes = _extract_allergy_terms(extracted_data.get("disliked_foods", []))
     if allergy_like_dislikes:
 
-        existing_allergies = _normalize_list(extracted_data.get("allergies", []))
-        merged_allergies = existing_allergies + [item for item in allergy_like_dislikes if item not in existing_allergies]
+        merged_allergies = _merge_unique_case_insensitive(existing_allergies + allergy_like_dislikes)
         update_query["preferences.allergies"] = merged_allergies
 
         filtered_disliked = []

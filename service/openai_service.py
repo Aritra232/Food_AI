@@ -28,6 +28,27 @@ Your responsibilities:
 - Remember conversation context
 """
 
+
+def _build_profile_context(profile):
+    preferences = (profile or {}).get("preferences", {})
+
+    allergies = preferences.get("allergies", []) or []
+    favorite_foods = preferences.get("favorite_foods", []) or []
+    disliked_foods = preferences.get("disliked_foods", []) or []
+    preferred_cuisines = preferences.get("preferred_cuisines", []) or []
+
+    return f"""
+Known User Profile:
+- Allergies: {', '.join(allergies) if allergies else 'None'}
+- Favorite foods: {', '.join(favorite_foods) if favorite_foods else 'None'}
+- Disliked foods: {', '.join(disliked_foods) if disliked_foods else 'None'}
+- Preferred cuisines: {', '.join(preferred_cuisines) if preferred_cuisines else 'None'}
+
+Safety rule:
+- Never suggest foods containing the user's allergies.
+- If asked for a recommendation that includes an allergen, propose safer alternatives.
+"""
+
 def chat_with_ai(user_id, user_message):
 
     profile = get_user_profile(user_id)
@@ -48,7 +69,7 @@ def chat_with_ai(user_id, user_message):
     messages = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT
+            "content": f"{SYSTEM_PROMPT}\n{_build_profile_context(profile)}"
         }
     ]
 

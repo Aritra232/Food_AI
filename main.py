@@ -20,6 +20,7 @@ from service.restaurant_service import (
 )
 
 from service.recommendation_service import recommend_foods
+from service.recommendation_service import filter_allergy_safe_foods
 
 from service.recommendation_response_service import (
     generate_recommendation_response,
@@ -41,7 +42,9 @@ from service.option_memory_service import (
     save_options,
     get_options,
     save_selected_item,
-    get_selected_item
+    get_selected_item,
+    save_last_blocked_items,
+    get_last_blocked_items
 )
 
 from service.cart_service import add_to_cart, get_cart
@@ -58,6 +61,71 @@ from service.order_service import (
 from service.order_service import calculate_total
 
 app = FastAPI()
+
+
+def _build_allergy_disclaimer(blocked_items, allergies):
+    if not blocked_items:
+        return ""
+
+    blocked_names = []
+    for blocked in blocked_items:
+        name = blocked.get("food_name")
+        if name and name not in blocked_names:
+            blocked_names.append(name)
+
+    blocked_text = ", ".join(blocked_names[:3])
+    if len(blocked_names) > 3:
+        blocked_text += ", and others"
+
+    return (
+        f"Safety note: I did not suggest {blocked_text} because they may contain "
+        f"your allergy item(s)."
+    )
+
+
+def _is_ingredient_question(message):
+    text = (message or "").lower()
+    return (
+        ("which" in text or "what" in text)
+        and ("ingredient" in text or "allergen" in text)
+    )
+
+
+def _build_blocked_ingredient_reply(message, blocked_items):
+    if not blocked_items:
+        return "I do not have recent blocked items to explain yet."
+
+    target_items = []
+    text = (message or "").lower()
+
+    for item in blocked_items:
+        name = str(item.get("food_name", "")).lower()
+        if name and name in text:
+            target_items.append(item)
+
+    if not target_items:
+        target_items = blocked_items
+
+    lines = []
+    for item in target_items[:3]:
+        name = item.get("food_name", "that item")
+        ingredients = item.get("matched_ingredients", [])
+        cleaned = []
+        seen = set()
+        for ingredient in ingredients:
+            key = str(ingredient).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(key)
+
+        if cleaned:
+            lines.append(f"For {name}, the allergen-related ingredient is: {', '.join(cleaned)}.")
+
+    if not lines:
+        return "I could not identify the exact ingredient name, but it was blocked for allergy safety."
+
+    return " ".join(lines)
 
 
 def parse_option_selection(message: str):
@@ -309,11 +377,24 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
     intent = detect_intent(message)
     state = get_state(user_id)
     profile = get_user_profile(user_id)
+    allergies = profile.get("preferences", {}).get("allergies", [])
 
     # -------------------------
     # CASE 4: NORMAL CHAT
     # -------------------------
     if intent == "chat":
+        if _is_ingredient_question(message):
+            blocked_items = get_last_blocked_items(user_id)
+            ingredient_reply = _build_blocked_ingredient_reply(message, blocked_items)
+            add_message(user_id, "user", message)
+            add_message(user_id, "assistant", ingredient_reply)
+            set_state(user_id, "chat")
+            return {
+                "intent": intent,
+                "state": "chat",
+                "message": ingredient_reply
+            }
+
         ai_response = chat_with_ai(user_id, message)
         set_state(user_id, "chat")
         return {
@@ -339,12 +420,20 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
     # -------------------------
     if intent == "order":
 
+        blocked_items = []
+        save_last_blocked_items(user_id, [])
+
         if lat and lng:
 
             recommendations = get_location_based_menus(
                 lat,
                 lng,
                 message
+            )
+
+            recommendations, blocked_items = filter_allergy_safe_foods(
+                recommendations,
+                allergies
             )
 
         else:
@@ -362,9 +451,20 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                 message
             )
 
+            # Try to include blocked list for disclaimer context when coming from location search.
+            if not blocked_items and lat and lng:
+                location_recommendations = get_location_based_menus(lat, lng, message)
+                _, blocked_items = filter_allergy_safe_foods(location_recommendations, allergies)
+
+        if blocked_items:
+            save_last_blocked_items(user_id, blocked_items)
+
         if not recommendations or len(recommendations) == 0:
 
             error_msg = "Sorry, no matching food is available in nearby restaurants."
+            disclaimer = _build_allergy_disclaimer(blocked_items, allergies)
+            if disclaimer:
+                error_msg = f"{error_msg} {disclaimer}"
             add_message(user_id, "assistant", error_msg)
 
             return {
@@ -388,6 +488,10 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             message,
             recommendations
         )
+
+        disclaimer = _build_allergy_disclaimer(blocked_items, allergies)
+        if disclaimer:
+            ai_response["response"] = f"{ai_response['response']}\n\n{disclaimer}"
 
         # Save AI response to conversation
         add_message(user_id, "assistant", ai_response["response"])

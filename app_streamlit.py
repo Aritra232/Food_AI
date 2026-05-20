@@ -17,6 +17,41 @@ st.set_page_config(
 # Custom CSS
 st.markdown("""
     <style>
+    .onboarding-shell {
+        background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
+        border: 1px solid rgba(15, 23, 42, 0.06);
+        border-radius: 28px;
+        padding: 28px;
+        box-shadow: 0 18px 60px rgba(15, 23, 42, 0.08);
+    }
+    .onboarding-title {
+        font-size: 30px;
+        font-weight: 800;
+        color: #1f2937;
+        margin-bottom: 6px;
+    }
+    .onboarding-subtitle {
+        color: #64748b;
+        font-size: 16px;
+        line-height: 1.6;
+        margin-bottom: 18px;
+    }
+    .onboarding-step {
+        height: 8px;
+        border-radius: 999px;
+        background: #e5e7eb;
+        overflow: hidden;
+    }
+    .onboarding-step.active {
+        background: linear-gradient(90deg, #d81f45 0%, #ea3a5f 100%);
+    }
+    .onboarding-summary {
+        background: white;
+        border-radius: 22px;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        padding: 24px;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+    }
     .user-message {
         background-color: #e3f2fd;
         padding: 12px;
@@ -78,6 +113,61 @@ if "pending_instruction_restaurant_id" not in st.session_state:
     st.session_state.pending_instruction_restaurant_id = None
 
 
+CUISINE_OPTIONS = [
+    "Indian",
+    "Chinese",
+    "Thai",
+    "Italian",
+    "Mexican",
+    "Japanese",
+    "Mediterranean",
+    "Korean",
+    "American",
+    "Healthy",
+    "Fast Food",
+    "Desserts",
+    "Breakfast",
+    "BBQ"
+]
+
+DIETARY_OPTIONS = [
+    "None",
+    "Vegan",
+    "Vegetarian",
+    "Halal",
+    "Kosher",
+    "Gluten-free",
+    "Dairy-free",
+    "Nut-free",
+    "Keto",
+    "Paleo",
+    "Low-carb"
+]
+
+BUDGET_OPTIONS = [
+    ("Budget Friendly", "low", "Under $10"),
+    ("Casual Dining", "medium", "$10 - $25"),
+    ("Fine Dining", "high", "$25 - $50"),
+    ("Premium", "high", "$50+")
+]
+
+ORDER_FREQUENCY_OPTIONS = [
+    "Daily",
+    "3-4 times/week",
+    "1-2 times/week",
+    "Occasionally"
+]
+
+ORDER_TIME_OPTIONS = [
+    "Breakfast",
+    "Lunch",
+    "Dinner",
+    "Late Night"
+]
+
+ADDRESS_TYPE_OPTIONS = ["Home", "Office"]
+
+
 def _extract_assistant_text(result):
     ai_response = result.get("ai_response")
 
@@ -92,6 +182,315 @@ def _extract_assistant_text(result):
             return result[key]
 
     return ""
+
+
+def _profile_is_onboarded(profile):
+    return bool(profile and profile.get("onboarding_completed"))
+
+
+def _sync_onboarding_state(profile):
+    preferences = (profile or {}).get("preferences", {})
+    delivery_address = (profile or {}).get("delivery_address", {})
+
+    st.session_state.onboarding_step = st.session_state.get("onboarding_step", 0)
+    st.session_state.onboarding_cuisines = preferences.get("preferred_cuisines", []) or []
+    restrictions = preferences.get("dietary_restrictions", []) or []
+    if not restrictions and preferences.get("dietary_style"):
+        restrictions = [item.strip() for item in str(preferences.get("dietary_style", "")).split(",") if item.strip()]
+    st.session_state.onboarding_restrictions = restrictions
+    st.session_state.onboarding_budget = preferences.get("budget_range", "") or ""
+    st.session_state.onboarding_order_frequency = preferences.get("order_frequency", "") or ""
+    st.session_state.onboarding_order_time = preferences.get("order_time", "") or ""
+    st.session_state.onboarding_address_type = delivery_address.get("address_type", "Home") or "Home"
+    st.session_state.onboarding_street_address = delivery_address.get("street_address", "") or ""
+    st.session_state.onboarding_city = delivery_address.get("city", "") or ""
+    st.session_state.onboarding_zip_code = delivery_address.get("zip_code", "") or ""
+
+
+def _load_user_profile(force=False):
+    loaded_user_id = st.session_state.get("loaded_profile_user_id")
+    if loaded_user_id and loaded_user_id != user_id:
+        st.session_state.user_profile = None
+        st.session_state.onboarding_step = 0
+        st.session_state.onboarding_show_success = False
+
+    if not force and st.session_state.get("loaded_profile_user_id") == user_id and st.session_state.get("user_profile"):
+        return st.session_state.user_profile
+
+    try:
+        response = requests.get(f"{API_BASE_URL}/user-profile", params={"user_id": user_id})
+        if response.status_code == 200:
+            profile = response.json()
+            st.session_state.user_profile = profile
+            st.session_state.loaded_profile_user_id = user_id
+            _sync_onboarding_state(profile)
+            return profile
+    except Exception:
+        pass
+
+    return st.session_state.get("user_profile")
+
+
+def _save_onboarding_profile():
+    cuisines = st.session_state.get("onboarding_cuisines", []) or []
+    restrictions = [item for item in (st.session_state.get("onboarding_restrictions", []) or []) if item != "None"]
+    budget_value = st.session_state.get("onboarding_budget", "")
+    meal_time = st.session_state.get("onboarding_order_time", "")
+
+    payload = {
+        "preferred_cuisines": cuisines,
+        "dietary_restrictions": restrictions,
+        "budget_range": budget_value,
+        "preferred_meal_time": [meal_time] if meal_time else [],
+        "order_frequency": st.session_state.get("onboarding_order_frequency", ""),
+        "order_time": meal_time,
+        "delivery_address": {
+            "address_type": st.session_state.get("onboarding_address_type", "Home"),
+            "street_address": st.session_state.get("onboarding_street_address", ""),
+            "city": st.session_state.get("onboarding_city", ""),
+            "zip_code": st.session_state.get("onboarding_zip_code", "")
+        }
+    }
+
+    response = requests.post(
+        f"{API_BASE_URL}/profile/onboarding",
+        params={"user_id": user_id},
+        json=payload
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to save profile: {response.status_code} {response.text}")
+
+    profile = response.json()
+    st.session_state.user_profile = profile
+    st.session_state.loaded_profile_user_id = user_id
+    st.session_state.onboarding_show_success = True
+    _sync_onboarding_state(profile)
+    return profile
+
+
+def _render_onboarding_progress(step_index, total_steps):
+    progress_cols = st.columns(total_steps)
+    for index, col in enumerate(progress_cols):
+        with col:
+            active = index <= step_index
+            st.markdown(
+                f"<div class='onboarding-step {'active' if active else ''}'></div>",
+                unsafe_allow_html=True
+            )
+
+
+def _render_onboarding_success():
+    st.markdown(
+        """
+        <div class="onboarding-shell" style="max-width:760px;margin:0 auto;">
+            <div style="display:flex;justify-content:center;margin-top:18px;">
+                <div style="width:96px;height:96px;border-radius:999px;background:linear-gradient(135deg,#d81f45 0%,#ef476f 100%);display:flex;align-items:center;justify-content:center;box-shadow:0 16px 40px rgba(216,31,69,0.28);">
+                    <div style="width:52px;height:52px;border-radius:999px;border:4px solid white;color:white;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:800;">✓</div>
+                </div>
+            </div>
+            <div style="text-align:center;margin-top:28px;">
+                <div class="onboarding-title">You're all set!</div>
+                <div class="onboarding-subtitle" style="max-width:520px;margin:0 auto;">
+                    Your preferences and address have been saved to your profile. We can now personalize the food experience for this user.
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col_primary, col_secondary = st.columns(2)
+    with col_primary:
+        if st.button("Start Ordering with AI", use_container_width=True):
+            st.session_state.onboarding_show_success = False
+            st.rerun()
+    with col_secondary:
+        if st.button("Explore App", use_container_width=True):
+            st.session_state.onboarding_show_success = False
+            st.rerun()
+
+
+def _render_onboarding_flow():
+    if st.session_state.get("onboarding_show_success"):
+        _render_onboarding_success()
+        st.stop()
+
+    if "onboarding_step" not in st.session_state:
+        st.session_state.onboarding_step = 0
+
+    step = st.session_state.onboarding_step
+    total_steps = 6
+
+    st.markdown("<div class='onboarding-shell'>", unsafe_allow_html=True)
+    _render_onboarding_progress(step, total_steps)
+    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+
+    if step == 0:
+        st.markdown("<div class='onboarding-title'>Welcome to Roub</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='onboarding-subtitle'>Answer a few quick questions so we can personalize food recommendations, understand your taste, and store your delivery details in your profile.</div>",
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            """
+            <div style="background:#fff5f7;border-radius:24px;padding:24px;border:1px solid rgba(216,31,69,0.08);margin-bottom:20px;">
+                <div style="font-size:18px;font-weight:700;color:#d81f45;margin-bottom:8px;">Personalized setup</div>
+                <div style="color:#64748b;line-height:1.6;">We will save your selected cuisines, dietary restrictions, budget, delivery address, and eating habits to the user profile.</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        col_left, col_right = st.columns([1, 1])
+        with col_left:
+            st.button("Skip for now", use_container_width=True, disabled=True)
+        with col_right:
+            if st.button("Proceed", use_container_width=True):
+                st.session_state.onboarding_step = 1
+                st.rerun()
+
+    elif step == 1:
+        st.markdown("<div class='onboarding-title'>What do you love to eat?</div>", unsafe_allow_html=True)
+        st.markdown("<div class='onboarding-subtitle'>Select all your favorite cuisines.</div>", unsafe_allow_html=True)
+        st.session_state.onboarding_cuisines = st.multiselect(
+            "Favorite cuisines",
+            CUISINE_OPTIONS,
+            default=st.session_state.get("onboarding_cuisines", []),
+            label_visibility="collapsed"
+        )
+        col_back, col_next = st.columns([1, 1.2])
+        with col_back:
+            if st.button("Back", use_container_width=True):
+                st.session_state.onboarding_step = 0
+                st.rerun()
+        with col_next:
+            if st.button("Next", use_container_width=True):
+                st.session_state.onboarding_step = 2
+                st.rerun()
+
+    elif step == 2:
+        st.markdown("<div class='onboarding-title'>Dietary Restrictions</div>", unsafe_allow_html=True)
+        st.markdown("<div class='onboarding-subtitle'>Help us personalize your meal recommendations.</div>", unsafe_allow_html=True)
+        st.session_state.onboarding_restrictions = st.multiselect(
+            "Dietary restrictions",
+            DIETARY_OPTIONS,
+            default=st.session_state.get("onboarding_restrictions", []),
+            label_visibility="collapsed"
+        )
+        col_back, col_next = st.columns([1, 1.2])
+        with col_back:
+            if st.button("Back", use_container_width=True):
+                st.session_state.onboarding_step = 1
+                st.rerun()
+        with col_next:
+            if st.button("Next", use_container_width=True):
+                st.session_state.onboarding_step = 3
+                st.rerun()
+
+    elif step == 3:
+        st.markdown("<div class='onboarding-title'>Select Your Budget</div>", unsafe_allow_html=True)
+        st.markdown("<div class='onboarding-subtitle'>Choose your preferred spending range.</div>", unsafe_allow_html=True)
+        budget_map = {label: value for label, value, _ in BUDGET_OPTIONS}
+        budget_labels = [label for label, _, _ in BUDGET_OPTIONS]
+        budget_display_map = {label: display for label, _, display in BUDGET_OPTIONS}
+        current_budget_label = next((label for label, value, _ in BUDGET_OPTIONS if value == st.session_state.get("onboarding_budget", "")), budget_labels[0])
+        selected_budget_label = st.radio(
+            "Budget range",
+            budget_labels,
+            index=budget_labels.index(current_budget_label),
+            horizontal=False,
+            label_visibility="collapsed"
+        )
+        st.session_state.onboarding_budget = budget_map[selected_budget_label]
+        st.caption(f"Selected: {budget_display_map[selected_budget_label]}")
+        col_back, col_next = st.columns([1, 1.2])
+        with col_back:
+            if st.button("Back", use_container_width=True):
+                st.session_state.onboarding_step = 2
+                st.rerun()
+        with col_next:
+            if st.button("Next", use_container_width=True):
+                st.session_state.onboarding_step = 4
+                st.rerun()
+
+    elif step == 4:
+        st.markdown("<div class='onboarding-title'>Delivery Address</div>", unsafe_allow_html=True)
+        st.markdown("<div class='onboarding-subtitle'>Where should we deliver your food?</div>", unsafe_allow_html=True)
+        st.session_state.onboarding_address_type = st.radio(
+            "Address type",
+            ADDRESS_TYPE_OPTIONS,
+            index=ADDRESS_TYPE_OPTIONS.index(st.session_state.get("onboarding_address_type", "Home") or "Home"),
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+        col_addr1, col_addr2 = st.columns(2)
+        with col_addr1:
+            st.session_state.onboarding_street_address = st.text_input(
+                "Street Address",
+                value=st.session_state.get("onboarding_street_address", ""),
+                placeholder="Street Address*"
+            )
+        with col_addr2:
+            st.session_state.onboarding_city = st.text_input(
+                "City",
+                value=st.session_state.get("onboarding_city", ""),
+                placeholder="City*"
+            )
+        st.session_state.onboarding_zip_code = st.text_input(
+            "ZIP Code",
+            value=st.session_state.get("onboarding_zip_code", ""),
+            placeholder="ZIP Code*"
+        )
+        col_back, col_next = st.columns([1, 1.2])
+        with col_back:
+            if st.button("Back", use_container_width=True):
+                st.session_state.onboarding_step = 3
+                st.rerun()
+        with col_next:
+            if st.button("Next", use_container_width=True):
+                st.session_state.onboarding_step = 5
+                st.rerun()
+
+    elif step == 5:
+        st.markdown("<div class='onboarding-title'>Your Eating Habits</div>", unsafe_allow_html=True)
+        st.markdown("<div class='onboarding-subtitle'>Help us understand your ordering patterns.</div>", unsafe_allow_html=True)
+        st.write("**How often do you order food?**")
+        st.session_state.onboarding_order_frequency = st.radio(
+            "Order frequency",
+            ORDER_FREQUENCY_OPTIONS,
+            index=ORDER_FREQUENCY_OPTIONS.index(st.session_state.get("onboarding_order_frequency", "Daily") or "Daily"),
+            label_visibility="collapsed"
+        )
+        st.write("**When do you usually order?**")
+        st.session_state.onboarding_order_time = st.radio(
+            "Order time",
+            ORDER_TIME_OPTIONS,
+            index=ORDER_TIME_OPTIONS.index(st.session_state.get("onboarding_order_time", "Breakfast") or "Breakfast"),
+            horizontal=False,
+            label_visibility="collapsed"
+        )
+
+        with st.container():
+            st.markdown("<div class='onboarding-summary'>", unsafe_allow_html=True)
+            st.markdown("<div style='font-size:18px;font-weight:700;color:#d81f45;text-align:center;margin-bottom:8px;'>R</div>", unsafe_allow_html=True)
+            st.markdown("<div style='text-align:center;color:#374151;line-height:1.6;'>Every bite, personalized - we will save these choices in your profile and use them to shape future recommendations.</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        col_back, col_save = st.columns([1, 1.2])
+        with col_back:
+            if st.button("Back", use_container_width=True):
+                st.session_state.onboarding_step = 4
+                st.rerun()
+        with col_save:
+            if st.button("Save Profile", use_container_width=True):
+                try:
+                    _save_onboarding_profile()
+                    st.session_state.onboarding_step = 0
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save profile: {exc}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _refresh_chat_history():
@@ -207,6 +606,15 @@ def _render_recommendations():
 # Main title
 st.title("🍔 Food AI Chatbot")
 st.markdown("---")
+
+current_profile = _load_user_profile()
+if st.session_state.get("onboarding_show_success"):
+    _render_onboarding_success()
+    st.stop()
+
+if current_profile and not _profile_is_onboarded(current_profile):
+    _render_onboarding_flow()
+    st.stop()
 
 # Create tabs
 tab1, tab2, tab3 = st.tabs(["💬 Chat", "👤 Profile", "🛒 Cart"])
@@ -353,9 +761,8 @@ with tab2:
     
     if st.button("Reload Profile"):
         try:
-            response = requests.get(f"{API_BASE_URL}/user-profile", params={"user_id": user_id})
-            if response.status_code == 200:
-                st.session_state.user_profile = response.json()
+            profile = _load_user_profile(force=True)
+            if profile:
                 st.success("Profile loaded!")
         except Exception as e:
             st.error(f"Error: {str(e)}")
@@ -379,8 +786,19 @@ with tab2:
         with col2:
             st.write(f"**Budget Range:** {preferences.get('budget_range') or 'Not set'}")
             st.write(f"**Dietary Style:** {preferences.get('dietary_style') or 'Not set'}")
+            st.write(f"**Dietary Restrictions:** {', '.join(preferences.get('dietary_restrictions', [])) or 'None'}")
+            st.write(f"**Order Frequency:** {preferences.get('order_frequency') or 'Not set'}")
+            st.write(f"**Order Time:** {preferences.get('order_time') or 'Not set'}")
             st.write(f"**Allergies:** {', '.join(preferences.get('allergies', [])) or 'None'}")
             st.write(f"**Favorite Drinks:** {', '.join(preferences.get('favorite_drinks', [])) or 'None'}")
+
+        delivery_address = profile.get("delivery_address", {}) or {}
+        st.subheader("📍 Delivery Address")
+        st.write(f"**Type:** {delivery_address.get('address_type') or 'Not set'}")
+        st.write(f"**Street Address:** {delivery_address.get('street_address') or 'Not set'}")
+        st.write(f"**City:** {delivery_address.get('city') or 'Not set'}")
+        st.write(f"**ZIP Code:** {delivery_address.get('zip_code') or 'Not set'}")
+        st.write(f"**Onboarding Completed:** {'Yes' if profile.get('onboarding_completed') else 'No'}")
         
         # Display raw JSON
         st.subheader("📊 Full Profile (JSON)")

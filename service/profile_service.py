@@ -80,17 +80,28 @@ def create_user_profile_if_not_exists(user_id):
 
     default_profile = {
         "user_id": user_id,
+        "onboarding_completed": False,
+        "onboarding_completed_at": None,
+        "delivery_address": {
+            "address_type": "",
+            "street_address": "",
+            "city": "",
+            "zip_code": ""
+        },
         "preferences": {
             "favorite_foods": [],
             "disliked_foods": [],
             "favorite_restaurants": [],
             "preferred_cuisines": [],
+            "dietary_restrictions": [],
             "spicy_level": "",
             "budget_range": "",
             "dietary_style": "",
             "allergies": [],
             "favorite_drinks": [],
             "preferred_meal_time": [],
+            "order_frequency": "",
+            "order_time": "",
             "delivery_speed_preference": "",
             "portion_size_preference": ""
         },
@@ -190,6 +201,34 @@ def update_user_preferences(user_id, extracted_data):
 
         update_query["preferences.preferred_cuisines"] = extracted_data["preferred_cuisines"]
 
+    if extracted_data.get("dietary_style"):
+
+        update_query["preferences.dietary_style"] = extracted_data["dietary_style"]
+
+    if extracted_data.get("dietary_restrictions"):
+
+        update_query["preferences.dietary_restrictions"] = extracted_data["dietary_restrictions"]
+
+    if extracted_data.get("order_frequency"):
+
+        update_query["preferences.order_frequency"] = extracted_data["order_frequency"]
+
+    if extracted_data.get("order_time"):
+
+        update_query["preferences.order_time"] = extracted_data["order_time"]
+
+    if extracted_data.get("delivery_address"):
+
+        update_query["delivery_address"] = extracted_data["delivery_address"]
+
+    if extracted_data.get("onboarding_completed") is not None:
+
+        update_query["onboarding_completed"] = bool(extracted_data["onboarding_completed"])
+
+        if extracted_data["onboarding_completed"]:
+
+            update_query["onboarding_completed_at"] = datetime.utcnow()
+
     for field, value in update_query.items():
 
         user_profile_collection.update_one(
@@ -202,6 +241,36 @@ def update_user_preferences(user_id, extracted_data):
                 }
             }
         )
+
+
+def save_onboarding_profile(user_id, onboarding_data):
+
+    create_user_profile_if_not_exists(user_id)
+
+    delivery_address = onboarding_data.get("delivery_address", {}) or {}
+    cleaned_address = {
+        "address_type": str(delivery_address.get("address_type", "")).strip(),
+        "street_address": str(delivery_address.get("street_address", "")).strip(),
+        "city": str(delivery_address.get("city", "")).strip(),
+        "zip_code": str(delivery_address.get("zip_code", "")).strip()
+    }
+
+    update_user_preferences(
+        user_id,
+        {
+            "preferred_cuisines": _normalize_list(onboarding_data.get("preferred_cuisines")),
+            "dietary_style": ", ".join(_normalize_list(onboarding_data.get("dietary_restrictions"))),
+            "dietary_restrictions": _normalize_list(onboarding_data.get("dietary_restrictions")),
+            "budget_range": str(onboarding_data.get("budget_range", "")).strip(),
+            "preferred_meal_time": _normalize_list(onboarding_data.get("preferred_meal_time")),
+            "order_frequency": str(onboarding_data.get("order_frequency", "")).strip(),
+            "order_time": str(onboarding_data.get("order_time", "")).strip(),
+            "delivery_address": cleaned_address,
+            "onboarding_completed": True
+        }
+    )
+
+    return get_user_profile(user_id)
 
 
 def record_order_history(user_id, item):

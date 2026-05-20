@@ -8,6 +8,7 @@ from service.profile_service import (
     get_user_profile,
     update_favorite_food,
     update_user_preferences,
+    save_onboarding_profile,
     record_order_history
 )
 
@@ -208,6 +209,12 @@ def get_profile_info(user_id: str):
     """Get user profile with preferences"""
     profile = get_user_profile(user_id)
     return profile
+
+
+@app.post("/profile/onboarding")
+def save_profile_onboarding(user_id: str, data: dict):
+    """Save onboarding preferences and address to the user profile."""
+    return save_onboarding_profile(user_id, data)
 
 
 # -------------------------

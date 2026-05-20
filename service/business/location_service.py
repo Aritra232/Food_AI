@@ -1,5 +1,5 @@
 import math
-from service.database_service import restaurant_collection
+from service.data.database_service import restaurant_collection
 
 
 # -------------------------

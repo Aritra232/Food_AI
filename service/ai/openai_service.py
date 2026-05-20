@@ -2,15 +2,15 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import os
 
-from service.memory_service import (
+from service.memory.memory_service import (
     get_conversation,
     add_message
 )
 
 
-from service.preference_extraction_service import extract_preferences
+from service.ai.preference_extraction_service import extract_preferences
 
-from service.profile_service import get_user_profile, update_user_preferences
+from service.data.profile_service import get_user_profile, update_user_preferences
 
 load_dotenv()
 
@@ -61,7 +61,8 @@ def chat_with_ai(user_id, user_message):
 
     update_user_preferences(
         user_id,
-        extracted_preferences
+        extracted_preferences,
+        source_message=user_message
     )
 
     conversation = get_conversation(user_id)

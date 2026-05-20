@@ -1,4 +1,4 @@
-from service.database_service import db
+from service.data.database_service import db
 
 state_collection = db["conversation_state"]
 

@@ -1,13 +1,13 @@
 import re
 
-from service.database_service import (
+from service.data.database_service import (
     restaurant_collection,
     menu_collection
 )
 
-from service.embedding_service import generate_embedding
-from service.pinecone_service import upsert_vectors, query_vector
-from service.location_service import get_nearby_restaurants
+from service.ai.embedding_service import generate_embedding
+from service.vector_db.pinecone_service import upsert_vectors, query_vector
+from service.business.location_service import get_nearby_restaurants
 
 
 # -------------------------

@@ -1,65 +1,40 @@
 import re
 from fastapi import FastAPI
-
-# Services
-from service.openai_service import chat_with_ai
-
-from service.profile_service import (
-    get_user_profile,
-    update_favorite_food,
-    update_user_preferences,
-    save_onboarding_profile,
-    record_order_history
-)
-
-from service.restaurant_service import (
-    add_restaurant,
-    add_menu_item,
-    search_food,
-    semantic_food_search,
-    get_location_based_menus
-)
-
-from service.recommendation_service import recommend_foods, filter_allergy_safe_foods
-
-from service.recommendation_response_service import (
-    generate_recommendation_response,
-    format_options
-)
-
-from service.embedding_service import generate_embedding
-from service.pinecone_service import upsert_vectors, query_vector
-
-from service.intent_service import detect_intent
-from service.state_service import get_state, set_state
-from service.memory_service import get_conversation, add_message
-
-from service.preference_extraction_service import extract_preferences
-
-from service.option_memory_service import (
-    save_options,
-    get_options,
-    save_selected_item,
-    get_selected_item,
-    save_last_blocked_items,
-    get_last_blocked_items,
-    get_last_saved_query,
-    save_last_instruction_context,
-    get_last_instruction_context
-)
-
-from service.cart_service import add_to_cart, get_cart
-from service.cart_service import update_item_instruction
-
-from service.database_service import menu_collection, restaurant_collection
 from bson import ObjectId
 
-from service.order_service import (
-    add_item,
-    remove_item,
-    get_or_create_cart,
-    calculate_total
+# AI Services
+from service.ai import chat_with_ai, generate_embedding, detect_intent, extract_preferences
+
+# Memory Services
+from service.memory import (
+    get_conversation, add_message,
+    save_options, get_options, save_selected_item, get_selected_item,
+    save_last_blocked_items, get_last_blocked_items, get_last_saved_query,
+    save_last_instruction_context, get_last_instruction_context
 )
+
+# Data Services
+from service.data import (
+    get_user_profile, update_favorite_food, update_user_preferences,
+    save_onboarding_profile, record_order_history
+)
+from service.data.database_service import menu_collection, restaurant_collection
+
+# Recommendation Services
+from service.recommendation import recommend_foods, filter_allergy_safe_foods, generate_recommendation_response, format_options
+
+# Business Services
+from service.business import (
+    add_restaurant, add_menu_item, search_food, semantic_food_search, get_location_based_menus,
+    add_to_cart, get_cart, update_item_instruction,
+    add_item, remove_item, get_or_create_cart, calculate_total
+)
+
+# Vector DB Services
+from service.vector_db import upsert_vectors, query_vector
+
+# State Services
+from service.state import get_state, set_state
 
 app = FastAPI()
 
@@ -451,7 +426,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
         refreshed_recommendations = None
         try:
             if extracted and extracted.get("allergies"):
-                from service.option_memory_service import get_last_saved_query
+                from service.memory import get_last_saved_query
 
                 last_query = get_last_saved_query(user_id)
                 if last_query:
@@ -492,7 +467,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
         existing_allergies=profile.get("preferences", {}).get("allergies", [])
     )
     if extracted_prefs:
-        update_user_preferences(user_id, extracted_prefs)
+        update_user_preferences(user_id, extracted_prefs, source_message=message)
 
     # -------------------------
     # CASE 1: ORDER FLOW
@@ -819,7 +794,7 @@ def add_instruction(user_id: str, instruction: str, restaurant_id: str = None):
 
     This endpoint always stores instructions at the cart document level (`cart.special_instructions`).
     """
-    from service.cart_service import set_cart_instruction
+    from service.business import set_cart_instruction
 
     if restaurant_id is None:
         restaurant_id = get_last_instruction_context(user_id)

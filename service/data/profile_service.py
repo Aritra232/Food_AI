@@ -1,7 +1,7 @@
 from datetime import datetime
 import re
 
-from service.database_service import user_profile_collection
+from service.data.database_service import user_profile_collection
 
 
 def _normalize_list(value):
@@ -37,10 +37,22 @@ def _is_generic_allergy_reference(value):
 
 def _extract_allergy_terms(values):
     allergies = []
+    allergy_markers = [
+        "allergic",
+        "allergy",
+        "allergies",
+        "intolerant",
+        "intolerance",
+        "reaction"
+    ]
 
     for value in _normalize_list(values):
         cleaned = value.strip()
         lower_value = cleaned.lower()
+
+        # Only treat disliked entries as allergies when explicit allergy language is present.
+        if not any(marker in lower_value for marker in allergy_markers):
+            continue
 
         if lower_value.startswith("allergic to "):
             cleaned = cleaned[12:].strip()
@@ -67,6 +79,42 @@ def _merge_unique_case_insensitive(items):
         merged.append(item)
 
     return merged
+
+
+def _contains_pattern(text, patterns):
+    if not text:
+        return False
+
+    lowered = str(text).lower()
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _should_update_favorite_foods(source_message):
+    if not source_message:
+        return True
+
+    favorite_patterns = [
+        r"\bfavo(?:u)?rite\b",
+        r"\bfav\b",
+        r"\bfvrt\b",
+        r"\bfavrt\b",
+        r"\bfvt\b",
+        r"\bi love\b",
+        r"\bi enjoy\b",
+        r"\bprefer\b"
+    ]
+    dislike_patterns = [
+        r"\bdon'?t like\b",
+        r"\bdo not like\b",
+        r"\bdislike\b",
+        r"\bhate\b",
+        r"\bnot a fan\b"
+    ]
+
+    if _contains_pattern(source_message, dislike_patterns):
+        return False
+
+    return _contains_pattern(source_message, favorite_patterns)
 
 
 def create_user_profile_if_not_exists(user_id):
@@ -141,7 +189,7 @@ def update_favorite_food(user_id, food_name):
     )
 
 
-def update_user_preferences(user_id, extracted_data):
+def update_user_preferences(user_id, extracted_data, source_message=None):
 
     create_user_profile_if_not_exists(user_id)
 
@@ -153,13 +201,20 @@ def update_user_preferences(user_id, extracted_data):
 
     update_query = {}
 
-    if extracted_data.get("favorite_foods"):
+    if extracted_data.get("favorite_foods") and _should_update_favorite_foods(source_message):
 
         update_query["preferences.favorite_foods"] = extracted_data["favorite_foods"]
 
     if extracted_data.get("disliked_foods"):
 
         update_query["preferences.disliked_foods"] = extracted_data["disliked_foods"]
+
+    # Favorite restaurants and drinks
+    if extracted_data.get("favorite_restaurants"):
+        update_query["preferences.favorite_restaurants"] = extracted_data["favorite_restaurants"]
+
+    if extracted_data.get("favorite_drinks"):
+        update_query["preferences.favorite_drinks"] = extracted_data["favorite_drinks"]
 
     if extracted_data.get("allergies"):
 
@@ -217,6 +272,14 @@ def update_user_preferences(user_id, extracted_data):
 
         update_query["preferences.order_time"] = extracted_data["order_time"]
 
+    # Delivery speed preference (string)
+    if extracted_data.get("delivery_speed_preference"):
+        update_query["preferences.delivery_speed_preference"] = extracted_data["delivery_speed_preference"]
+
+    # Preferred meal time (list)
+    if extracted_data.get("preferred_meal_time"):
+        update_query["preferences.preferred_meal_time"] = extracted_data["preferred_meal_time"]
+
     if extracted_data.get("delivery_address"):
 
         update_query["delivery_address"] = extracted_data["delivery_address"]
@@ -229,16 +292,44 @@ def update_user_preferences(user_id, extracted_data):
 
             update_query["onboarding_completed_at"] = datetime.utcnow()
 
-    for field, value in update_query.items():
+    # Separate list fields (accumulate) from scalar fields (replace)
+    list_fields = {
+        "preferences.favorite_foods",
+        "preferences.disliked_foods",
+        "preferences.allergies",
+        "preferences.preferred_cuisines",
+        "preferences.favorite_restaurants",
+        "preferences.favorite_drinks",
+        "preferences.dietary_restrictions",
+        "preferences.preferred_meal_time"
+    }
 
+    add_to_set_ops = {}
+    set_ops = {}
+
+    for field, value in update_query.items():
+        if field in list_fields and isinstance(value, list):
+            # For list fields, accumulate values using $addToSet with $each
+            add_to_set_ops[field] = {"$each": value}
+        else:
+            # For scalar fields (strings, objects), use $set to replace
+            set_ops[field] = value
+
+    # Apply $addToSet operations for list fields
+    if add_to_set_ops:
+        user_profile_collection.update_one(
+            {"user_id": user_id},
+            {"$addToSet": add_to_set_ops}
+        )
+
+    # Apply $set operations for scalar fields
+    if set_ops:
         user_profile_collection.update_one(
             {
                 "user_id": user_id
             },
             {
-                "$set": {
-                    field: value
-                }
+                "$set": set_ops
             }
         )
 
@@ -267,7 +358,8 @@ def save_onboarding_profile(user_id, onboarding_data):
             "order_time": str(onboarding_data.get("order_time", "")).strip(),
             "delivery_address": cleaned_address,
             "onboarding_completed": True
-        }
+        },
+        source_message=None
     )
 
     return get_user_profile(user_id)
@@ -293,23 +385,14 @@ def record_order_history(user_id, item):
     }
     operations["$set"]["last_ordered_at"] = datetime.utcnow()
 
-    if item.get("food_name"):
-        operations["$addToSet"]["preferences.favorite_foods"] = {"$each": _normalize_list(item.get("food_name"))}
+    # Clean up empty operators
+    update_ops = {}
+    for k, v in operations.items():
+        if v:
+            update_ops[k] = v
 
-    if restaurant:
-        operations["$addToSet"]["preferences.favorite_restaurants"] = restaurant
+    if update_ops:
+        user_profile_collection.update_one({"user_id": user_id}, update_ops)
 
-    if cuisine:
-        cuisines = _normalize_list(cuisine)
-        if cuisines:
-            operations["$addToSet"]["preferences.preferred_cuisines"] = {"$each": cuisines}
-
-    final_ops = {}
-    if operations["$addToSet"]:
-        final_ops["$addToSet"] = operations["$addToSet"]
-    if operations["$push"]:
-        final_ops["$push"] = operations["$push"]
-    if operations["$set"]:
-        final_ops["$set"] = operations["$set"]
-
-    user_profile_collection.update_one({"user_id": user_id}, final_ops)
+    # Return the updated profile for convenience
+    return get_user_profile(user_id)

@@ -4,7 +4,8 @@ import json
 from datetime import datetime
 
 # Configuration
-API_BASE_URL = "http://localhost:8000"
+# Use 127.0.0.1 to avoid IPv6/localhost resolving to another local service
+API_BASE_URL = "http://127.0.0.1:8000"
 
 # Page configuration
 st.set_page_config(

@@ -1,8 +1,8 @@
-from service.profile_service import get_user_profile
+from service.data.profile_service import get_user_profile
 import re
 from difflib import SequenceMatcher
 
-from service.restaurant_service import hybrid_food_search
+from service.business.restaurant_service import hybrid_food_search
 
 
 def _normalize_token(value):
@@ -298,18 +298,3 @@ def recommend_foods(user_id, food_query):
         item["_id"] = str(
             item["_id"]
         )
-
-        item["recommendation_score"] = score
-
-        ranked_foods.append(
-            item
-        )
-
-    ranked_foods.sort(
-        key=lambda x: x[
-            "recommendation_score"
-        ],
-        reverse=True
-    )
-
-    return ranked_foods

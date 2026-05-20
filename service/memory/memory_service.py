@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from service.database_service import conversation_collection
+from service.data.database_service import conversation_collection
 
 
 def get_conversation(user_id):

@@ -9,7 +9,7 @@ from .memory import (
 )
 from .data import (
     get_user_profile, update_favorite_food, update_user_preferences,
-    save_onboarding_profile, record_order_history
+    save_onboarding_profile, add_delivery_address, select_delivery_address, record_order_history
 )
 from .recommendation import recommend_foods, filter_allergy_safe_foods, generate_recommendation_response, format_options
 from .business import (
@@ -30,7 +30,7 @@ __all__ = [
     'save_last_instruction_context', 'get_last_instruction_context',
     # Data Services
     'get_user_profile', 'update_favorite_food', 'update_user_preferences',
-    'save_onboarding_profile', 'record_order_history',
+    'save_onboarding_profile', 'add_delivery_address', 'select_delivery_address', 'record_order_history',
     # Recommendation Services
     'recommend_foods', 'filter_allergy_safe_foods', 'generate_recommendation_response', 'format_options',
     # Business Services

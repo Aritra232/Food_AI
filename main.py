@@ -1,5 +1,6 @@
 import re
-from fastapi import FastAPI
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
 from bson import ObjectId
 
 # AI Services
@@ -16,9 +17,9 @@ from service.memory import (
 # Data Services
 from service.data import (
     get_user_profile, update_favorite_food, update_user_preferences,
-    save_onboarding_profile, record_order_history
+    save_onboarding_profile, add_delivery_address, select_delivery_address, record_order_history
 )
-from service.data.database_service import menu_collection, restaurant_collection
+from service.data.database_service import menu_collection, restaurant_collection, restaurant_requests_collection
 
 # Recommendation Services
 from service.recommendation import recommend_foods, filter_allergy_safe_foods, generate_recommendation_response, format_options
@@ -657,7 +658,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                         "message": success_msg,
                         "cart": cart,
                         "show_instruction_card": True,
-                        "restaurant_id": restaurant_id
+                        "restaurant_id": restaurant_id  
                     }
 
                 # After adding to cart, proactively suggest desserts / cold items
@@ -802,3 +803,94 @@ def add_instruction(user_id: str, instruction: str, restaurant_id: str = None):
     set_cart_instruction(user_id, instruction, restaurant_id=restaurant_id)
     add_message(user_id, "assistant", "Saved cart-level instruction.")
     return {"status": "ok", "target": "cart_level"}
+
+
+@app.post("/profile/address")
+def upsert_profile_address(user_id: str, address: dict = None, address_id: str = None):
+    """Add a new delivery address or select an existing one."""
+    if address_id:
+        return select_delivery_address(user_id, address_id)
+
+    if not address:
+        raise HTTPException(status_code=400, detail="Address data is required")
+
+    return add_delivery_address(user_id, address)
+
+
+def _build_order_summary(cart):
+    items = cart.get("items", []) if cart else []
+    subtotal = sum(float(item.get("price", 0)) * int(item.get("quantity", 1)) for item in items)
+    delivery_fee = 12
+    total = subtotal + delivery_fee
+
+    return {
+        "items": items,
+        "subtotal": subtotal,
+        "delivery_fee": delivery_fee,
+        "total": total
+    }
+
+
+@app.post("/restaurant-request")
+def create_restaurant_request(user_id: str, data: dict = None):
+    """Create a restaurant request with pending status."""
+    profile = get_user_profile(user_id)
+    cart = get_cart(user_id) or {"user_id": user_id, "items": []}
+    summary = _build_order_summary(cart)
+    delivery_address = profile.get("delivery_address") or {}
+
+    restaurant_ids = []
+    for item in summary["items"]:
+        restaurant_id = item.get("restaurant_id")
+        if restaurant_id and restaurant_id not in restaurant_ids:
+            restaurant_ids.append(restaurant_id)
+
+    restaurant_id = restaurant_ids[0] if restaurant_ids else None
+    if not restaurant_id:
+        raise HTTPException(status_code=400, detail="No restaurant found for the current cart")
+
+    request_doc = {
+        "user_id": user_id,
+        "restaurant_id": restaurant_id,
+        "restaurant_ids": restaurant_ids,
+        "status": "pending",
+        "cart": cart,
+        "summary": summary,
+        "delivery_address": delivery_address,
+        "instruction": (data or {}).get("instruction", ""),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+
+    inserted = restaurant_requests_collection.insert_one(request_doc)
+    request_doc["_id"] = str(inserted.inserted_id)
+    return request_doc
+
+
+@app.patch("/restaurant-request/{request_id}")
+def update_restaurant_request_status(request_id: str, status: str):
+    """Update a restaurant request status to pending, accept, or reject."""
+    if status not in {"pending", "accept", "reject"}:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    try:
+        object_id = ObjectId(request_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid request id") from exc
+
+    result = restaurant_requests_collection.update_one(
+        {"_id": object_id},
+        {
+            "$set": {
+                "status": status,
+                "updated_at": datetime.utcnow()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Restaurant request not found")
+
+    updated = restaurant_requests_collection.find_one({"_id": object_id})
+    updated["_id"] = str(updated["_id"])
+    return updated

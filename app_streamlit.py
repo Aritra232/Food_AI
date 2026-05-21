@@ -112,6 +112,14 @@ if "instruction_input_open" not in st.session_state:
     st.session_state.instruction_input_open = False
 if "pending_instruction_restaurant_id" not in st.session_state:
     st.session_state.pending_instruction_restaurant_id = None
+if "awaiting_delivery_address_prompt" not in st.session_state:
+    st.session_state.awaiting_delivery_address_prompt = False
+if "delivery_address_input_open" not in st.session_state:
+    st.session_state.delivery_address_input_open = False
+if "awaiting_order_summary_prompt" not in st.session_state:
+    st.session_state.awaiting_order_summary_prompt = False
+if "restaurant_request_created" not in st.session_state:
+    st.session_state.restaurant_request_created = None
 
 
 CUISINE_OPTIONS = [
@@ -214,6 +222,13 @@ def _load_user_profile(force=False):
         st.session_state.user_profile = None
         st.session_state.onboarding_step = 0
         st.session_state.onboarding_show_success = False
+        st.session_state.awaiting_instruction_prompt = False
+        st.session_state.instruction_input_open = False
+        st.session_state.pending_instruction_restaurant_id = None
+        st.session_state.awaiting_delivery_address_prompt = False
+        st.session_state.delivery_address_input_open = False
+        st.session_state.awaiting_order_summary_prompt = False
+        st.session_state.restaurant_request_created = None
 
     if not force and st.session_state.get("loaded_profile_user_id") == user_id and st.session_state.get("user_profile"):
         return st.session_state.user_profile
@@ -494,6 +509,236 @@ def _render_onboarding_flow():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def _get_profile_delivery_addresses(profile):
+    addresses = (profile or {}).get("delivery_addresses") or []
+    if not addresses:
+        fallback_address = (profile or {}).get("delivery_address") or {}
+        if any(fallback_address.get(field) for field in ("street_address", "city", "zip_code", "address_type")):
+            addresses = [fallback_address]
+    return addresses
+
+
+def _format_address_label(address):
+    address_type = address.get("address_type") or "Saved address"
+    street_address = address.get("street_address") or ""
+    city = address.get("city") or ""
+    zip_code = address.get("zip_code") or ""
+    details = ", ".join([part for part in [street_address, city, zip_code] if part])
+    return f"{address_type} - {details}" if details else address_type
+
+
+def _save_delivery_address(address_payload):
+    response = requests.post(
+        f"{API_BASE_URL}/profile/address",
+        params={"user_id": user_id},
+        json=address_payload
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to save address: {response.status_code} {response.text}")
+
+    profile = response.json()
+    st.session_state.user_profile = profile
+    st.session_state.loaded_profile_user_id = user_id
+    return profile
+
+
+def _select_delivery_address(address_id):
+    response = requests.post(
+        f"{API_BASE_URL}/profile/address",
+        params={"user_id": user_id, "address_id": address_id}
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to select address: {response.status_code} {response.text}")
+
+    profile = response.json()
+    st.session_state.user_profile = profile
+    st.session_state.loaded_profile_user_id = user_id
+    return profile
+
+
+def _load_cart_summary():
+    response = requests.get(f"{API_BASE_URL}/cart", params={"user_id": user_id})
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to load cart: {response.status_code} {response.text}")
+    return response.json()
+
+
+def _create_restaurant_request():
+    response = requests.post(
+        f"{API_BASE_URL}/restaurant-request",
+        params={"user_id": user_id},
+        json={}
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to create restaurant request: {response.status_code} {response.text}")
+
+    return response.json()
+
+
+def _render_delivery_address_flow():
+    profile = _load_user_profile(force=True) or st.session_state.get("user_profile") or {}
+    addresses = _get_profile_delivery_addresses(profile)
+
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style="background:#ffffff;border-radius:24px;padding:22px;border:1px solid #f1f1f1;box-shadow:0 10px 30px rgba(0,0,0,0.04);">
+            <div style="font-size:20px;font-weight:700;color:#1f2937;margin-bottom:10px;">Select a delivery address</div>
+            <div style="font-size:15px;line-height:1.6;color:#6b7280;margin-bottom:16px;">Choose one of your saved addresses or add a new address before we create the restaurant request.</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    address_choices = []
+    address_labels = {}
+    for address in addresses:
+        address_id = address.get("address_id") or _format_address_label(address)
+        label = _format_address_label(address)
+        address_choices.append(address_id)
+        address_labels[address_id] = label
+
+    address_choices.append("__new__")
+    address_labels["__new__"] = "Add New Address"
+
+    selected_address_key = st.radio(
+        "Delivery address",
+        address_choices,
+        format_func=lambda key: address_labels.get(key, key),
+        key="delivery_address_choice"
+    )
+
+    if selected_address_key == "__new__":
+        st.session_state.delivery_address_input_open = True
+    else:
+        st.session_state.delivery_address_input_open = False
+
+    if st.session_state.get("delivery_address_input_open"):
+        col_label, col_leave = st.columns([3, 1])
+        with col_label:
+            address_type = st.text_input("Address label", placeholder="Home / Work / Other", key="new_address_label")
+        with col_leave:
+            leave_at_door = st.toggle("Leave at the door", value=False, key="new_address_leave_at_door")
+
+        street_address = st.text_input("Street address", placeholder="House No, Street, Area", key="new_address_street")
+        col_city, col_zip = st.columns(2)
+        with col_city:
+            city = st.text_input("City", placeholder="City", key="new_address_city")
+        with col_zip:
+            zip_code = st.text_input("ZIP Code", placeholder="ZIP Code", key="new_address_zip")
+
+        if st.button("Save New Address", use_container_width=True):
+            if not street_address or not city or not zip_code:
+                st.error("Please fill in street address, city, and ZIP code.")
+            else:
+                try:
+                    profile = _save_delivery_address(
+                        {
+                            "address_type": address_type or "Home",
+                            "street_address": street_address,
+                            "city": city,
+                            "zip_code": zip_code,
+                            "leave_at_door": leave_at_door,
+                            "is_default": True
+                        }
+                    )
+                    st.session_state.awaiting_delivery_address_prompt = False
+                    st.session_state.awaiting_order_summary_prompt = True
+                    st.session_state.restaurant_request_created = None
+                    st.success("New address saved.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+    else:
+        col_back, col_continue = st.columns([1, 1.4])
+        with col_back:
+            if st.button("Back", use_container_width=True):
+                st.session_state.awaiting_delivery_address_prompt = False
+                st.session_state.instruction_input_open = True
+                st.rerun()
+        with col_continue:
+            if st.button("Continue to Summary", use_container_width=True):
+                try:
+                    if selected_address_key != "__new__":
+                        _select_delivery_address(selected_address_key)
+                    st.session_state.awaiting_delivery_address_prompt = False
+                    st.session_state.awaiting_order_summary_prompt = True
+                    st.session_state.restaurant_request_created = None
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+
+def _render_order_summary_flow():
+    profile = _load_user_profile(force=True) or st.session_state.get("user_profile") or {}
+    cart_payload = _load_cart_summary()
+    cart = cart_payload.get("cart", {}) or {}
+    total_price = float(cart_payload.get("total_price", 0) or 0)
+    delivery_fee = 12
+    grand_total = total_price + delivery_fee
+    items = cart.get("items", []) or []
+    delivery_address = profile.get("delivery_address", {}) or {}
+
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style="background:#ffffff;border-radius:24px;padding:22px;border:1px solid #f1f1f1;box-shadow:0 10px 30px rgba(0,0,0,0.04);">
+            <div style="font-size:20px;font-weight:700;color:#1f2937;margin-bottom:10px;">Great! Here is a total summary of your order. Please recheck!</div>
+            <div style="font-size:15px;line-height:1.6;color:#6b7280;margin-bottom:12px;">We fetched the latest items from your cart and your selected delivery address before sending the request to the restaurant.</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    with st.container(border=True):
+        st.subheader("Order Summary")
+        for item in items:
+            col_img, col_name, col_price = st.columns([1, 4, 1])
+            with col_img:
+                image_url = item.get("image_url")
+                if image_url:
+                    st.image(image_url, width=72)
+                else:
+                    st.markdown(
+                        "<div style='width:72px;height:72px;border-radius:16px;background:#fff1f2;display:flex;align-items:center;justify-content:center;font-size:28px;'>🍽️</div>",
+                        unsafe_allow_html=True
+                    )
+            with col_name:
+                st.write(item.get("food_name", "Item"))
+                st.caption(f"{item.get('quantity', 1)}x")
+            with col_price:
+                st.markdown(f"**${float(item.get('price', 0)) * int(item.get('quantity', 1)):.0f}**")
+
+        st.markdown("---")
+        st.write(f"**Subtotal:** ${total_price:.0f}")
+        st.write(f"**Standard delivery:** ${delivery_fee:.0f}")
+        st.markdown(f"### Total: ${grand_total:.0f}")
+
+        st.subheader("Delivery Address")
+        st.write(f"**{delivery_address.get('address_type') or 'Saved address'}**")
+        st.write(delivery_address.get("street_address") or "")
+        st.write(", ".join([part for part in [delivery_address.get("city"), delivery_address.get("zip_code")] if part]))
+
+        if st.button("Request to Restaurant", use_container_width=True):
+            try:
+                request_doc = _create_restaurant_request()
+                st.session_state.restaurant_request_created = request_doc
+                st.session_state.awaiting_order_summary_prompt = False
+                st.success(f"Request sent to restaurant. Status: {request_doc.get('status', 'pending')}")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    if st.session_state.get("restaurant_request_created"):
+        request_doc = st.session_state.restaurant_request_created
+        st.info(
+            f"Restaurant request saved with status: {request_doc.get('status', 'pending')} (pending / accept / reject)"
+        )
+
+
 def _refresh_chat_history():
     try:
         history_response = requests.get(
@@ -607,6 +852,12 @@ def _render_recommendations():
 # Main title
 st.title("🍔 Food AI Chatbot")
 st.markdown("---")
+
+if st.session_state.get("restaurant_request_created"):
+    request_doc = st.session_state.restaurant_request_created
+    st.success(
+        f"Restaurant request saved. Current status: {request_doc.get('status', 'pending')} (pending / accept / reject)"
+    )
 
 current_profile = _load_user_profile()
 if st.session_state.get("onboarding_show_success"):
@@ -745,11 +996,22 @@ with tab1:
                         st.session_state.awaiting_instruction_prompt = False
                         st.session_state.instruction_input_open = False
                         st.session_state.pending_instruction_restaurant_id = None
+                        st.session_state.awaiting_delivery_address_prompt = True
+                        st.session_state.delivery_address_input_open = False
+                        st.session_state.awaiting_order_summary_prompt = False
                         st.rerun()
                     else:
                         st.error(f"Failed to save instruction: {resp.status_code}")
                 except Exception as e:
                     st.error(f"Error saving instruction: {str(e)}")
+
+    if st.session_state.get("awaiting_delivery_address_prompt"):
+        _render_delivery_address_flow()
+        st.stop()
+
+    if st.session_state.get("awaiting_order_summary_prompt"):
+        _render_order_summary_flow()
+        st.stop()
 
     _render_recommendations()
 
@@ -775,6 +1037,8 @@ with tab2:
         
         st.subheader("🎯 Preferences")
         preferences = profile.get("preferences", {})
+        addresses = profile.get("delivery_addresses", []) or []
+        selected_address_id = profile.get("selected_delivery_address_id")
         
         col1, col2 = st.columns(2)
         
@@ -800,6 +1064,14 @@ with tab2:
         st.write(f"**City:** {delivery_address.get('city') or 'Not set'}")
         st.write(f"**ZIP Code:** {delivery_address.get('zip_code') or 'Not set'}")
         st.write(f"**Onboarding Completed:** {'Yes' if profile.get('onboarding_completed') else 'No'}")
+
+        if addresses:
+            st.subheader("📚 Saved Addresses")
+            for address in addresses:
+                marker = "(Selected)" if address.get("address_id") == selected_address_id else ""
+                st.write(
+                    f"- **{address.get('address_type') or 'Address'}** {marker} | {address.get('street_address') or ''}, {address.get('city') or ''} {address.get('zip_code') or ''}"
+                )
         
         # Display raw JSON
         st.subheader("📊 Full Profile (JSON)")

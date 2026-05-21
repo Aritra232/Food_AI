@@ -5,6 +5,8 @@ from .profile_service import (
     update_favorite_food,
     update_user_preferences,
     save_onboarding_profile,
+    add_delivery_address,
+    select_delivery_address,
     record_order_history
 )
 
@@ -16,5 +18,7 @@ __all__ = [
     'update_favorite_food',
     'update_user_preferences',
     'save_onboarding_profile',
+    'add_delivery_address',
+    'select_delivery_address',
     'record_order_history'
 ]

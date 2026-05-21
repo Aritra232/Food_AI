@@ -1,5 +1,6 @@
 from datetime import datetime
 import re
+from uuid import uuid4
 
 from service.data.database_service import user_profile_collection
 
@@ -81,6 +82,39 @@ def _merge_unique_case_insensitive(items):
     return merged
 
 
+def _normalize_address(address, default_label="Home", address_id=None, is_default=False):
+
+    address = address or {}
+
+    return {
+        "address_id": address_id or str(address.get("address_id") or uuid4().hex),
+        "address_type": str(address.get("address_type") or default_label).strip() or default_label,
+        "street_address": str(address.get("street_address", "")).strip(),
+        "city": str(address.get("city", "")).strip(),
+        "zip_code": str(address.get("zip_code", "")).strip(),
+        "leave_at_door": bool(address.get("leave_at_door", False)),
+        "is_default": bool(is_default or address.get("is_default", False))
+    }
+
+
+def _backfill_delivery_addresses(profile):
+
+    delivery_addresses = profile.get("delivery_addresses") or []
+    delivery_address = profile.get("delivery_address") or {}
+
+    if not delivery_addresses and any(delivery_address.get(field) for field in ("street_address", "city", "zip_code", "address_type")):
+        delivery_addresses = [_normalize_address(delivery_address, default_label=delivery_address.get("address_type") or "Home", is_default=True)]
+
+    if not profile.get("selected_delivery_address_id") and delivery_addresses:
+        profile["selected_delivery_address_id"] = delivery_addresses[0].get("address_id")
+
+    if not profile.get("delivery_address") and delivery_addresses:
+        profile["delivery_address"] = delivery_addresses[0]
+
+    profile["delivery_addresses"] = delivery_addresses
+    return profile
+
+
 def _contains_pattern(text, patterns):
     if not text:
         return False
@@ -134,8 +168,11 @@ def create_user_profile_if_not_exists(user_id):
             "address_type": "",
             "street_address": "",
             "city": "",
-            "zip_code": ""
+            "zip_code": "",
+            "leave_at_door": False
         },
+        "delivery_addresses": [],
+        "selected_delivery_address_id": "",
         "preferences": {
             "favorite_foods": [],
             "disliked_foods": [],
@@ -167,6 +204,8 @@ def get_user_profile(user_id):
     profile = user_profile_collection.find_one({
         "user_id": user_id
     })
+
+    profile = _backfill_delivery_addresses(profile)
 
     profile["_id"] = str(profile["_id"])
 
@@ -339,12 +378,7 @@ def save_onboarding_profile(user_id, onboarding_data):
     create_user_profile_if_not_exists(user_id)
 
     delivery_address = onboarding_data.get("delivery_address", {}) or {}
-    cleaned_address = {
-        "address_type": str(delivery_address.get("address_type", "")).strip(),
-        "street_address": str(delivery_address.get("street_address", "")).strip(),
-        "city": str(delivery_address.get("city", "")).strip(),
-        "zip_code": str(delivery_address.get("zip_code", "")).strip()
-    }
+    cleaned_address = _normalize_address(delivery_address, default_label=delivery_address.get("address_type") or "Home", is_default=True)
 
     update_user_preferences(
         user_id,
@@ -360,6 +394,79 @@ def save_onboarding_profile(user_id, onboarding_data):
             "onboarding_completed": True
         },
         source_message=None
+    )
+
+    user_profile_collection.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "delivery_addresses": [cleaned_address],
+                "selected_delivery_address_id": cleaned_address["address_id"]
+            }
+        }
+    )
+
+    return get_user_profile(user_id)
+
+
+def add_delivery_address(user_id, address_data):
+
+    create_user_profile_if_not_exists(user_id)
+
+    profile = user_profile_collection.find_one({"user_id": user_id}) or {}
+    existing_addresses = profile.get("delivery_addresses") or []
+    normalized_address = _normalize_address(address_data, default_label=address_data.get("address_type") or address_data.get("label") or "Home")
+
+    if normalized_address.get("is_default"):
+        for item in existing_addresses:
+            item["is_default"] = False
+
+    if not existing_addresses:
+        normalized_address["is_default"] = True
+
+    existing_addresses.append(normalized_address)
+
+    user_profile_collection.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "delivery_addresses": existing_addresses,
+                "delivery_address": normalized_address,
+                "selected_delivery_address_id": normalized_address["address_id"]
+            }
+        }
+    )
+
+    return get_user_profile(user_id)
+
+
+def select_delivery_address(user_id, address_id):
+
+    create_user_profile_if_not_exists(user_id)
+
+    profile = user_profile_collection.find_one({"user_id": user_id}) or {}
+    addresses = profile.get("delivery_addresses") or []
+
+    selected = None
+    for address in addresses:
+        if address.get("address_id") == address_id:
+            selected = address
+            break
+
+    if not selected and addresses:
+        selected = addresses[0]
+
+    if not selected:
+        return get_user_profile(user_id)
+
+    user_profile_collection.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "delivery_address": selected,
+                "selected_delivery_address_id": selected.get("address_id")
+            }
+        }
     )
 
     return get_user_profile(user_id)

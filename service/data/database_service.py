@@ -48,4 +48,9 @@ state_collection = db["states"]
 # -------------------------
 orders_collection = db["orders"]
 
+# -------------------------
+# RESTAURANT REQUESTS
+# -------------------------
+restaurant_requests_collection = db["restaurant_requests"]
+
 session_collection = db["sessions"]

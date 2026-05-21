@@ -9,6 +9,7 @@ from service.ai import chat_with_ai, generate_embedding, detect_intent, extract_
 # Memory Services
 from service.memory import (
     get_conversation, add_message,
+    get_or_create_chat_session, create_new_chat_session, list_chat_sessions,
     save_options, get_options, save_selected_item, get_selected_item,
     save_last_blocked_items, get_last_blocked_items, get_last_saved_query,
     save_last_instruction_context, get_last_instruction_context
@@ -168,16 +169,29 @@ def favorite_food(user_id: str, food: str):
 
 
 @app.get("/chat-history")
-def get_chat_history(user_id: str):
-    """Get conversation history for a user"""
-    history = get_conversation(user_id)
+def get_chat_history(user_id: str, session_id: str = None):
+    """Get conversation history and chat sessions for a user"""
+    active_session = get_or_create_chat_session(user_id, session_id=session_id)
+    history = get_conversation(user_id, session_id=active_session.get("session_id"))
     profile = get_user_profile(user_id)
     
     return {
         "user_id": user_id,
         "chat_history": history,
-        "user_profile": profile
+        "user_profile": profile,
+        "chat_sessions": list_chat_sessions(user_id),
+        "active_session_id": active_session.get("session_id")
     }
+
+
+@app.post("/chat-session")
+def create_chat_session(user_id: str, title: str = None):
+    """Start a new chat thread for the user."""
+    session = create_new_chat_session(user_id, title=title)
+    session["_id"] = str(session["_id"])
+    session["created_at"] = session["created_at"].isoformat()
+    session["updated_at"] = session["updated_at"].isoformat()
+    return session
 
 
 @app.get("/user-profile")
@@ -374,7 +388,9 @@ def hybrid_search(query: str, top_k: int = 5, cuisine: str = None, max_price: fl
 
 
 @app.post("/chat")
-def chat(user_id: str, message: str, lat: float = None, lng: float = None):
+def chat(user_id: str, message: str, lat: float = None, lng: float = None, session_id: str = None):
+
+    get_or_create_chat_session(user_id, session_id=session_id)
 
     intent = detect_intent(message)
     state = get_state(user_id)

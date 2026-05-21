@@ -83,9 +83,46 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+
 # Sidebar - User Settings
 st.sidebar.title("👤 User Settings")
-user_id = st.sidebar.text_input("User ID", value="user123", placeholder="Enter your user ID")
+if "current_user_id" not in st.session_state:
+    st.session_state.current_user_id = "user123"
+
+with st.sidebar.form("user_id_form"):
+    user_id_input = st.text_input(
+        "User ID",
+        value=st.session_state.current_user_id,
+        placeholder="Enter your user ID"
+    )
+    load_user_clicked = st.form_submit_button("Load User")
+
+if load_user_clicked:
+    if user_id_input != st.session_state.current_user_id:
+        st.session_state.current_user_id = user_id_input
+        st.session_state.user_profile = None
+        st.session_state.chat_history = []
+        st.session_state.chat_sessions = []
+        st.session_state.active_chat_session_id = None
+        st.session_state.awaiting_instruction_prompt = False
+        st.session_state.instruction_input_open = False
+        st.session_state.pending_instruction_restaurant_id = None
+        st.session_state.awaiting_delivery_address_prompt = False
+        st.session_state.delivery_address_input_open = False
+        st.session_state.awaiting_order_summary_prompt = False
+        st.session_state.restaurant_request_created = None
+        st.session_state.onboarding_show_success = False
+        st.session_state.chat_session_selector = None
+        st.session_state.is_new_chat_draft = False
+    else:
+        st.session_state.chat_session_selector = None
+        st.session_state.chat_history = []
+        st.session_state.chat_sessions = []
+        st.session_state.active_chat_session_id = None
+        st.session_state.is_new_chat_draft = False
+    st.rerun()
+
+user_id = st.session_state.current_user_id
 
 st.sidebar.title("📍 Location")
 lat = st.sidebar.number_input("Latitude", value=23.8103, step=0.0001)
@@ -120,6 +157,14 @@ if "awaiting_order_summary_prompt" not in st.session_state:
     st.session_state.awaiting_order_summary_prompt = False
 if "restaurant_request_created" not in st.session_state:
     st.session_state.restaurant_request_created = None
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
+if "active_chat_session_id" not in st.session_state:
+    st.session_state.active_chat_session_id = None
+if "chat_session_selector" not in st.session_state:
+    st.session_state.chat_session_selector = None
+if "is_new_chat_draft" not in st.session_state:
+    st.session_state.is_new_chat_draft = False
 
 
 CUISINE_OPTIONS = [
@@ -229,6 +274,10 @@ def _load_user_profile(force=False):
         st.session_state.delivery_address_input_open = False
         st.session_state.awaiting_order_summary_prompt = False
         st.session_state.restaurant_request_created = None
+        st.session_state.chat_history = []
+        st.session_state.chat_sessions = []
+        st.session_state.active_chat_session_id = None
+        st.session_state.chat_session_selector = None
 
     if not force and st.session_state.get("loaded_profile_user_id") == user_id and st.session_state.get("user_profile"):
         return st.session_state.user_profile
@@ -283,6 +332,58 @@ def _save_onboarding_profile():
     st.session_state.onboarding_show_success = True
     _sync_onboarding_state(profile)
     return profile
+
+
+def _format_chat_session_label(session):
+    title = (session or {}).get("title") or "New chat"
+    preview = (session or {}).get("preview") or ""
+    if preview:
+        return f"{title} - {preview}"
+    return title
+
+
+def _load_chat_history(session_id=None, force=False):
+    params = {"user_id": user_id}
+    if session_id:
+        params["session_id"] = session_id
+
+    response = requests.get(f"{API_BASE_URL}/chat-history", params=params)
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to load chat history: {response.status_code} {response.text}")
+
+    data = response.json()
+    st.session_state.chat_history = data.get("chat_history", [])
+    st.session_state.user_profile = data.get("user_profile")
+    st.session_state.chat_sessions = data.get("chat_sessions", [])
+    st.session_state.active_chat_session_id = data.get("active_session_id")
+    st.session_state.loaded_profile_user_id = user_id
+    return data
+
+
+def _create_chat_session(title=None):
+    response = requests.post(
+        f"{API_BASE_URL}/chat-session",
+        params={"user_id": user_id, "title": title or "New chat"}
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to create chat session: {response.status_code} {response.text}")
+
+    session = response.json()
+    st.session_state.active_chat_session_id = session.get("session_id")
+    st.session_state.chat_session_selector = session.get("session_id")
+    _load_chat_history(session_id=session.get("session_id"))
+    return session
+
+
+def _start_new_chat_draft():
+    st.session_state.is_new_chat_draft = True
+    st.session_state.active_chat_session_id = None
+    st.session_state.chat_session_selector = None
+    st.session_state.chat_history = []
+    st.session_state.current_recommendations = []
+    st.session_state.option_quantities = {}
+    st.session_state.selected_option_text = ""
 
 
 def _render_onboarding_progress(step_index, total_steps):
@@ -739,29 +840,16 @@ def _render_order_summary_flow():
         )
 
 
-def _refresh_chat_history():
-    try:
-        history_response = requests.get(
-            f"{API_BASE_URL}/chat-history",
-            params={"user_id": user_id}
-        )
-
-        if history_response.status_code == 200:
-            data = history_response.json()
-            st.session_state.chat_history = data["chat_history"]
-            st.session_state.user_profile = data["user_profile"]
-    except Exception:
-        pass
-
-
 def _send_chat_message(message_text):
+    active_session_id = st.session_state.get("active_chat_session_id")
     response = requests.post(
         f"{API_BASE_URL}/chat",
         params={
             "user_id": user_id,
             "message": message_text,
             "lat": lat,
-            "lng": lng
+            "lng": lng,
+            "session_id": active_session_id
         }
     )
 
@@ -791,8 +879,57 @@ def _send_chat_message(message_text):
             for i in range(len(st.session_state.current_recommendations))
         }
 
-    _refresh_chat_history()
+    if result.get("session_id"):
+        st.session_state.active_chat_session_id = result["session_id"]
+        st.session_state.chat_session_selector = result["session_id"]
+
+    if st.session_state.get("is_new_chat_draft"):
+        st.session_state.is_new_chat_draft = False
+
+    try:
+        _load_chat_history(session_id=st.session_state.get("active_chat_session_id"))
+    except Exception:
+        pass
+
     return result, None
+
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("💬 Previous Chats")
+
+if st.sidebar.button("＋ New Chat", use_container_width=True):
+    try:
+        _start_new_chat_draft()
+        st.rerun()
+    except Exception as exc:
+        st.sidebar.error(str(exc))
+
+chat_sessions = st.session_state.get("chat_sessions", []) or []
+if chat_sessions:
+    session_ids = [session.get("session_id") for session in chat_sessions if session.get("session_id")]
+    active_session_id = st.session_state.get("active_chat_session_id")
+    if active_session_id not in session_ids:
+        active_session_id = session_ids[0]
+
+    if st.session_state.get("is_new_chat_draft"):
+        st.sidebar.info("New chat draft")
+    else:
+        selected_session_id = st.sidebar.selectbox(
+            "Open chat",
+            session_ids,
+            index=session_ids.index(active_session_id),
+            key="chat_session_selector",
+            format_func=lambda session_id: _format_chat_session_label(next((session for session in chat_sessions if session.get("session_id") == session_id), {}))
+        )
+
+        if selected_session_id != st.session_state.get("active_chat_session_id"):
+            try:
+                _load_chat_history(session_id=selected_session_id)
+                st.rerun()
+            except Exception as exc:
+                st.sidebar.error(str(exc))
+else:
+    st.sidebar.info("Your previous chats will appear here.")
 
 
 def _render_recommendations():
@@ -868,12 +1005,26 @@ if current_profile and not _profile_is_onboarded(current_profile):
     _render_onboarding_flow()
     st.stop()
 
+if st.session_state.get("loaded_profile_user_id") == user_id and not st.session_state.get("chat_sessions") and not st.session_state.get("is_new_chat_draft"):
+    try:
+        _load_chat_history(session_id=st.session_state.get("active_chat_session_id"))
+    except Exception:
+        pass
+
 # Create tabs
 tab1, tab2, tab3 = st.tabs(["💬 Chat", "👤 Profile", "🛒 Cart"])
 
 # ==================== CHAT TAB ====================
 with tab1:
     st.subheader("Chat with Food AI Assistant")
+    active_session = next(
+        (session for session in st.session_state.get("chat_sessions", []) if session.get("session_id") == st.session_state.get("active_chat_session_id")),
+        None
+    )
+    if st.session_state.get("is_new_chat_draft"):
+        st.caption("Current chat: New chat")
+    elif active_session:
+        st.caption(f"Current chat: {_format_chat_session_label(active_session)}")
     
     # Display chat history
     chat_container = st.container()
@@ -881,12 +1032,8 @@ with tab1:
     # Fetch chat history
     if st.button("🔄 Refresh Chat History"):
         try:
-            response = requests.get(f"{API_BASE_URL}/chat-history", params={"user_id": user_id})
-            if response.status_code == 200:
-                data = response.json()
-                st.session_state.chat_history = data["chat_history"]
-                st.session_state.user_profile = data["user_profile"]
-                st.success("Chat history loaded!")
+            _load_chat_history(session_id=st.session_state.get("active_chat_session_id"), force=True)
+            st.success("Chat history loaded!")
         except Exception as e:
             st.error(f"Error loading chat history: {str(e)}")
     

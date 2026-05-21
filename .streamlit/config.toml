@@ -1,0 +1,5 @@
+[server]
+# Increase keepalive tolerance to reduce websocket 1011 ping timeout disconnects.
+websocketPingInterval = 60
+# Keep disconnected sessions longer so brief network drops can reconnect.
+disconnectedSessionTTL = 600

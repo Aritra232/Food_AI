@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import json
 from datetime import datetime
+from uuid import uuid4
 
 # Configuration
 # Use 127.0.0.1 to avoid IPv6/localhost resolving to another local service
@@ -91,9 +92,56 @@ st.sidebar.title("📍 Location")
 lat = st.sidebar.number_input("Latitude", value=23.8103, step=0.0001)
 lng = st.sidebar.number_input("Longitude", value=90.4125, step=0.0001)
 
+st.sidebar.title("💬 Chats")
+if st.sidebar.button("New chat", use_container_width=True):
+    st.session_state.active_chat_session_id = f"draft-{uuid4().hex}"
+    st.session_state.chat_history = []
+    st.session_state.current_recommendations = []
+    st.session_state.option_quantities = {}
+    st.session_state.last_assistant_response = ""
+    st.session_state.awaiting_instruction_prompt = False
+    st.session_state.instruction_input_open = False
+    st.session_state.awaiting_delivery_address_prompt = False
+    st.session_state.delivery_address_input_open = False
+    st.session_state.awaiting_order_summary_prompt = False
+    st.rerun()
+
+try:
+    chat_history_response = requests.get(
+        f"{API_BASE_URL}/chat-history",
+        params={
+            "user_id": user_id,
+            "chat_session_id": st.session_state.get("active_chat_session_id")
+        }
+    )
+    if chat_history_response.status_code == 200:
+        chat_data = chat_history_response.json()
+        st.session_state.chat_history = chat_data.get("chat_history", [])
+        st.session_state.chat_sessions = chat_data.get("chat_sessions", [])
+        if chat_data.get("chat_session_id"):
+            st.session_state.active_chat_session_id = chat_data.get("chat_session_id")
+        elif not st.session_state.active_chat_session_id and not st.session_state.chat_sessions:
+            st.session_state.active_chat_session_id = f"draft-{uuid4().hex}"
+except Exception:
+    pass
+
+if st.session_state.chat_sessions:
+    st.sidebar.caption("Recent chats")
+    for index, chat_session in enumerate(st.session_state.chat_sessions[:8]):
+        session_label = chat_session.get("title") or "New chat"
+        session_id = chat_session.get("chat_session_id") or f"legacy-session-{index}"
+        button_label = session_label if len(session_label) <= 28 else f"{session_label[:28]}..."
+        if st.sidebar.button(button_label, key=f"chat_session_{index}_{session_id}", use_container_width=True):
+            st.session_state.active_chat_session_id = session_id
+            st.rerun()
+
 # Initialize session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
+if "active_chat_session_id" not in st.session_state:
+    st.session_state.active_chat_session_id = None
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = None
 if "last_recommendations" not in st.session_state:
@@ -220,6 +268,9 @@ def _load_user_profile(force=False):
     loaded_user_id = st.session_state.get("loaded_profile_user_id")
     if loaded_user_id and loaded_user_id != user_id:
         st.session_state.user_profile = None
+        st.session_state.chat_history = []
+        st.session_state.chat_sessions = []
+        st.session_state.active_chat_session_id = None
         st.session_state.onboarding_step = 0
         st.session_state.onboarding_show_success = False
         st.session_state.awaiting_instruction_prompt = False
@@ -743,12 +794,18 @@ def _refresh_chat_history():
     try:
         history_response = requests.get(
             f"{API_BASE_URL}/chat-history",
-            params={"user_id": user_id}
+            params={
+                "user_id": user_id,
+                "chat_session_id": st.session_state.get("active_chat_session_id")
+            }
         )
 
         if history_response.status_code == 200:
             data = history_response.json()
-            st.session_state.chat_history = data["chat_history"]
+            st.session_state.chat_history = data.get("chat_history", [])
+            st.session_state.chat_sessions = data.get("chat_sessions", [])
+            if data.get("chat_session_id"):
+                st.session_state.active_chat_session_id = data.get("chat_session_id")
             st.session_state.user_profile = data["user_profile"]
     except Exception:
         pass
@@ -761,7 +818,8 @@ def _send_chat_message(message_text):
             "user_id": user_id,
             "message": message_text,
             "lat": lat,
-            "lng": lng
+            "lng": lng,
+            "chat_session_id": st.session_state.get("active_chat_session_id")
         }
     )
 
@@ -881,10 +939,19 @@ with tab1:
     # Fetch chat history
     if st.button("🔄 Refresh Chat History"):
         try:
-            response = requests.get(f"{API_BASE_URL}/chat-history", params={"user_id": user_id})
+            response = requests.get(
+                f"{API_BASE_URL}/chat-history",
+                params={
+                    "user_id": user_id,
+                    "chat_session_id": st.session_state.get("active_chat_session_id")
+                }
+            )
             if response.status_code == 200:
                 data = response.json()
-                st.session_state.chat_history = data["chat_history"]
+                st.session_state.chat_history = data.get("chat_history", [])
+                st.session_state.chat_sessions = data.get("chat_sessions", [])
+                if data.get("chat_session_id"):
+                    st.session_state.active_chat_session_id = data.get("chat_session_id")
                 st.session_state.user_profile = data["user_profile"]
                 st.success("Chat history loaded!")
         except Exception as e:
@@ -988,7 +1055,8 @@ with tab1:
                         params={
                             "user_id": user_id,
                             "instruction": instruction_text,
-                            "restaurant_id": st.session_state.get("pending_instruction_restaurant_id")
+                            "restaurant_id": st.session_state.get("pending_instruction_restaurant_id"),
+                            "chat_session_id": st.session_state.get("active_chat_session_id")
                         }
                     )
                     if resp.status_code == 200:

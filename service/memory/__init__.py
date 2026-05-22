@@ -1,4 +1,4 @@
-from .memory_service import get_conversation, add_message
+from .memory_service import get_chat_sessions, ensure_chat_session, get_conversation, add_message
 from .session_memory_service import save_session, get_session, clear_session
 from .option_memory_service import (
     save_options,
@@ -13,6 +13,8 @@ from .option_memory_service import (
 )
 
 __all__ = [
+    'get_chat_sessions',
+    'ensure_chat_session',
     'get_conversation',
     'add_message',
     'save_session',

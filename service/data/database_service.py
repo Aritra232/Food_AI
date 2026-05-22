@@ -17,6 +17,7 @@ db = client["food_ai_agent_db"]
 # CONVERSATION MEMORY
 # -------------------------
 conversation_collection = db["conversations"]
+chat_session_collection = db["chat_sessions"]
 
 # -------------------------
 # USER PROFILE

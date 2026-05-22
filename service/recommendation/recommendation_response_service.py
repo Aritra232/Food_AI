@@ -12,6 +12,8 @@ client = OpenAI(
 
 def format_options(recommendations):
 
+    recommendations = recommendations or []
+
     options_map = {}
     options_text = ""
 
@@ -46,6 +48,14 @@ def generate_recommendation_response(
     user_message,
     recommendations
 ):
+
+    recommendations = recommendations or []
+
+    if not recommendations:
+        return {
+            "response": "I could not find any matching food right now. Try a different food name or search again.",
+            "options": {}
+        }
 
     formatted_foods, options = format_options(
         recommendations

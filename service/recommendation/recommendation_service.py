@@ -298,3 +298,10 @@ def recommend_foods(user_id, food_query):
         item["_id"] = str(
             item["_id"]
         )
+
+        item["score"] = score
+        ranked_foods.append(item)
+
+    ranked_foods.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    return ranked_foods[:5]

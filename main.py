@@ -8,7 +8,7 @@ from service.ai import chat_with_ai, generate_embedding, detect_intent, extract_
 
 # Memory Services
 from service.memory import (
-    get_conversation, add_message,
+    get_chat_sessions, get_conversation, add_message,
     save_options, get_options, save_selected_item, get_selected_item,
     save_last_blocked_items, get_last_blocked_items, get_last_saved_query,
     save_last_instruction_context, get_last_instruction_context
@@ -168,14 +168,20 @@ def favorite_food(user_id: str, food: str):
 
 
 @app.get("/chat-history")
-def get_chat_history(user_id: str):
+def get_chat_history(user_id: str, chat_session_id: str = None):
     """Get conversation history for a user"""
-    history = get_conversation(user_id)
+    sessions = get_chat_sessions(user_id)
+    if not chat_session_id and sessions:
+        chat_session_id = sessions[0].get("chat_session_id")
+
+    history = get_conversation(user_id, chat_session_id) if chat_session_id else []
     profile = get_user_profile(user_id)
     
     return {
         "user_id": user_id,
+        "chat_session_id": chat_session_id,
         "chat_history": history,
+        "chat_sessions": sessions,
         "user_profile": profile
     }
 
@@ -374,7 +380,7 @@ def hybrid_search(query: str, top_k: int = 5, cuisine: str = None, max_price: fl
 
 
 @app.post("/chat")
-def chat(user_id: str, message: str, lat: float = None, lng: float = None):
+def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_session_id: str = None):
 
     intent = detect_intent(message)
     state = get_state(user_id)
@@ -389,8 +395,8 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
         if _is_ingredient_question(message):
             blocked_items = get_last_blocked_items(user_id)
             ingredient_reply = _build_blocked_ingredient_reply(message, blocked_items)
-            add_message(user_id, "user", message)
-            add_message(user_id, "assistant", ingredient_reply)
+            add_message(user_id, "user", message, chat_session_id)
+            add_message(user_id, "assistant", ingredient_reply, chat_session_id)
             set_state(user_id, "chat")
             return {
                 "intent": intent,
@@ -406,8 +412,8 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                     "Add any special requests or dietary notes below to customize your order!"
                 )
 
-                add_message(user_id, "user", message)
-                add_message(user_id, "assistant", prompt_msg)
+                add_message(user_id, "user", message, chat_session_id)
+                add_message(user_id, "assistant", prompt_msg, chat_session_id)
                 set_state(user_id, "instruction_prompt")
 
                 return {
@@ -459,12 +465,12 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
     
 
     # Save user message to conversation history for order/select/checkout flow
-    add_message(user_id, "user", message)
+    add_message(user_id, "user", message, chat_session_id)
 
     # Extract preferences from user message
     extracted_prefs = extract_preferences(
         message,
-        conversation_history=get_conversation(user_id),
+        conversation_history=get_conversation(user_id, chat_session_id),
         existing_allergies=profile.get("preferences", {}).get("allergies", [])
     )
     if extracted_prefs:
@@ -520,7 +526,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             disclaimer = _build_allergy_disclaimer(blocked_items, allergies)
             if disclaimer:
                 error_msg = f"{error_msg} {disclaimer}"
-            add_message(user_id, "assistant", error_msg)
+            add_message(user_id, "assistant", error_msg, chat_session_id)
 
             return {
                 "intent": intent,
@@ -550,7 +556,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             ai_response["response"] = f"{ai_response['response']}\n\n{disclaimer}"
 
         # Save AI response to conversation
-        add_message(user_id, "assistant", ai_response["response"])
+        add_message(user_id, "assistant", ai_response["response"], chat_session_id)
 
         set_state(
             user_id,
@@ -578,7 +584,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
         if not selected:
 
             error_msg = "Invalid option selected"
-            add_message(user_id, "assistant", error_msg)
+            add_message(user_id, "assistant", error_msg, chat_session_id)
 
             return {
                 "error": error_msg
@@ -597,7 +603,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
         if not menu_item:
 
             error_msg = "Selected menu item not found"
-            add_message(user_id, "assistant", error_msg)
+            add_message(user_id, "assistant", error_msg, chat_session_id)
 
             return {
                 "error": error_msg
@@ -616,7 +622,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
         set_state(user_id, "selected")
 
         confirm_msg = "Item selected. Say 'yes' or 'confirm' to add to cart."
-        add_message(user_id, "assistant", confirm_msg)
+        add_message(user_id, "assistant", confirm_msg, chat_session_id)
 
         return {
             "intent": intent,
@@ -650,7 +656,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                     restaurant_id = selected_item.get("restaurant_id")
                     save_last_instruction_context(user_id, restaurant_id)
 
-                    add_message(user_id, "assistant", success_msg)
+                    add_message(user_id, "assistant", success_msg, chat_session_id)
 
                     return {
                         "intent": intent,
@@ -705,7 +711,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                             pass
 
                         full_msg = f"{success_msg}\n\n{ai_reco['response']}"
-                        add_message(user_id, "assistant", full_msg)
+                        add_message(user_id, "assistant", full_msg, chat_session_id)
 
                         return {
                             "intent": intent,
@@ -722,7 +728,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
                     # fallback: still return success message
                     pass
 
-                add_message(user_id, "assistant", success_msg)
+                add_message(user_id, "assistant", success_msg, chat_session_id)
 
                 return {
                     "intent": intent,
@@ -734,7 +740,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             else:
 
                 error_msg = "No item selected to confirm"
-                add_message(user_id, "assistant", error_msg)
+                add_message(user_id, "assistant", error_msg, chat_session_id)
 
                 return {
                     "intent": intent,
@@ -747,7 +753,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
             set_state(user_id, "checkout")
 
             confirm_msg = "Please say 'yes' to confirm and add the selected item to cart"
-            add_message(user_id, "assistant", confirm_msg)
+            add_message(user_id, "assistant", confirm_msg, chat_session_id)
 
             return {
                 "intent": intent,
@@ -759,7 +765,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None):
     # FALLBACK CHAT
     # -------------------------
     default_msg = "I am here to help you find food or place an order."
-    add_message(user_id, "assistant", default_msg)
+    add_message(user_id, "assistant", default_msg, chat_session_id)
 
     return {
         "intent": intent,
@@ -790,7 +796,7 @@ def view_cart(user_id: str):
 
 
 @app.post("/instruction")
-def add_instruction(user_id: str, instruction: str, restaurant_id: str = None):
+def add_instruction(user_id: str, instruction: str, restaurant_id: str = None, chat_session_id: str = None):
     """Save a cart-level special instruction for the user's cart.
 
     This endpoint always stores instructions at the cart document level (`cart.special_instructions`).
@@ -801,7 +807,7 @@ def add_instruction(user_id: str, instruction: str, restaurant_id: str = None):
         restaurant_id = get_last_instruction_context(user_id)
 
     set_cart_instruction(user_id, instruction, restaurant_id=restaurant_id)
-    add_message(user_id, "assistant", "Saved cart-level instruction.")
+    add_message(user_id, "assistant", "Saved cart-level instruction.", chat_session_id)
     return {"status": "ok", "target": "cart_level"}
 
 
@@ -865,6 +871,25 @@ def create_restaurant_request(user_id: str, data: dict = None):
     inserted = restaurant_requests_collection.insert_one(request_doc)
     request_doc["_id"] = str(inserted.inserted_id)
     return request_doc
+
+
+@app.get("/restaurant-requests")
+def list_restaurant_requests(user_id: str = None, limit: int = 50):
+    """List restaurant requests. If `user_id` is provided, filter by that user.
+
+    This endpoint helps Swagger/UI discover valid `request_id` values.
+    """
+    query = {}
+    if user_id:
+        query["user_id"] = user_id
+
+    cursor = restaurant_requests_collection.find(query).sort("created_at", -1).limit(int(limit or 50))
+    results = []
+    for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        results.append(doc)
+
+    return {"count": len(results), "requests": results}
 
 
 @app.patch("/restaurant-request/{request_id}")

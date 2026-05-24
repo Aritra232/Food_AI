@@ -54,6 +54,64 @@ def _normalize_output_list(value):
     return []
 
 
+def _normalize_text(value):
+    return re.sub(r"[^a-z0-9\- ]", " ", str(value or "").lower()).strip()
+
+
+def _normalize_dietary_value(value):
+    text = _normalize_text(value)
+    if not text:
+        return ""
+
+    aliases = {
+        "vegan": "vegan",
+        "vegetarian": "vegetarian",
+        "halal": "halal",
+        "kosher": "kosher",
+        "gluten free": "gluten-free",
+        "gluten-free": "gluten-free",
+        "dairy free": "dairy-free",
+        "dairy-free": "dairy-free",
+        "nut free": "nut-free",
+        "nut-free": "nut-free",
+        "keto": "keto",
+        "paleo": "paleo",
+        "low carb": "low-carb",
+        "low-carb": "low-carb"
+    }
+
+    if text in aliases:
+        return aliases[text]
+
+    compact = text.replace(" ", "")
+    compact_aliases = {
+        "glutenfree": "gluten-free",
+        "dairyfree": "dairy-free",
+        "nutfree": "nut-free",
+        "lowcarb": "low-carb"
+    }
+
+    return compact_aliases.get(compact, text)
+
+
+def _normalize_dietary_list(value):
+    items = []
+    for item in _normalize_output_list(value):
+        normalized = _normalize_dietary_value(item)
+        if normalized:
+            items.append(normalized)
+
+    deduped = []
+    seen = set()
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def _expand_user_shorthand(message):
     if not message:
         return ""
@@ -122,6 +180,18 @@ def _sanitize_extracted_preferences(user_message, extracted):
     extracted["favorite_restaurants"] = fav_rests
     extracted["favorite_drinks"] = fav_drinks
 
+    dietary_style = extracted.get("dietary_style")
+    if isinstance(dietary_style, list):
+        dietary_style = dietary_style[0] if dietary_style else ""
+    dietary_style = _normalize_dietary_value(dietary_style)
+
+    dietary_restrictions = _normalize_dietary_list(extracted.get("dietary_restrictions"))
+    if dietary_style and dietary_style not in dietary_restrictions:
+        dietary_restrictions.insert(0, dietary_style)
+
+    extracted["dietary_style"] = dietary_style
+    extracted["dietary_restrictions"] = dietary_restrictions
+
     # Normalize delivery speed preference
     dsp = extracted.get("delivery_speed_preference")
     if isinstance(dsp, str):
@@ -162,6 +232,8 @@ def extract_preferences_with_context(user_message, conversation_history=None, ex
         "favorite_foods": [],
         "disliked_foods": [],
         "allergies": [],
+        "dietary_style": "",
+        "dietary_restrictions": [],
         "spicy_level": "",
         "budget_range": "",
         "preferred_cuisines": [],
@@ -175,6 +247,8 @@ def extract_preferences_with_context(user_message, conversation_history=None, ex
     - If the user says they are allergic to something, put it in "allergies".
     - Do NOT place allergy items in "disliked_foods".
     - Use "disliked_foods" only for foods the user does not like.
+    - If the user mentions a diet such as vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, or low-carb, fill both "dietary_style" and "dietary_restrictions" with the best matching normalized label.
+    - If the user describes a custom diet in their own words, normalize it to the closest useful menu label rather than copying the exact wording verbatim.
     - If the user says "both", "all of them", "these", "those", "them", or similar, resolve it to the exact allergy items from the recent conversation context.
     - Never store vague words like "both" as an allergy item.
     - Users may type short forms (example: fvrt=favorite, algy=allergy, bgt=budget, spcy=spicy, addr=address). Interpret these correctly.

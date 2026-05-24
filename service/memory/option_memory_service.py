@@ -3,13 +3,19 @@ from service.data.database_service import db
 option_collection = db["user_options"]
 
 
-def save_options(user_id, options_dict, original_query=None):
+def save_options(user_id, options_dict, original_query=None, recommendation_batch_id=None):
 
     payload = {
         "options": options_dict
     }
     if original_query:
         payload["last_query"] = original_query
+
+    if recommendation_batch_id:
+        payload["active_recommendation_batch_id"] = recommendation_batch_id
+        payload[f"options_by_batch.{recommendation_batch_id}"] = options_dict
+        if original_query:
+            payload[f"batch_queries.{recommendation_batch_id}"] = original_query
 
     option_collection.update_one(
         {"user_id": user_id},
@@ -45,7 +51,7 @@ def get_selected_item(user_id):
     return data.get("selected_item")
 
 
-def get_options(user_id):
+def get_options(user_id, recommendation_batch_id=None):
 
     data = option_collection.find_one(
         {"user_id": user_id}
@@ -53,6 +59,11 @@ def get_options(user_id):
 
     if not data:
         return {}
+
+    if recommendation_batch_id:
+        batch_options = (data.get("options_by_batch") or {}).get(recommendation_batch_id)
+        if batch_options:
+            return batch_options
 
     return data.get("options", {})
 

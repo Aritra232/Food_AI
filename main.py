@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from bson import ObjectId
 
@@ -22,7 +23,13 @@ from service.data import (
 from service.data.database_service import menu_collection, restaurant_collection, restaurant_requests_collection
 
 # Recommendation Services
-from service.recommendation import recommend_foods, filter_allergy_safe_foods, generate_recommendation_response, format_options
+from service.recommendation import (
+    recommend_foods,
+    filter_allergy_safe_foods,
+    generate_recommendation_response,
+    format_options,
+    is_dietary_safe
+)
 
 # Business Services
 from service.business import (
@@ -70,7 +77,198 @@ def _is_ingredient_question(message):
 
 def _is_no_thanks_message(message):
     text = (message or "").strip().lower()
-    return text in {"no thanks", "no thank you", "no, thanks", "no", "skip"}
+    return text in {
+        "no thanks", "no thank you", "no, thanks", "no", "skip",
+        "don't want", "do not want", "dont want", "not this",
+        "never mind", "nah", "nope", "not that"
+    }
+
+
+def _get_dessert_terms_regex():
+    return r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|pudding|brownie|pastry|gelato|dessert|sweet"
+
+
+def _normalize_family_text(value):
+    return re.sub(r"[^a-z0-9 ]", " ", str(value or "").lower()).strip()
+
+
+def _get_food_family_keywords(item):
+    text = _normalize_family_text(" ".join([
+        str(item.get("category", "")),
+        str(item.get("food_name", ""))
+    ]))
+
+    family_keywords = [
+        "burger", "burgers", "biryani", "pizza", "pasta", "noodle", "noodles",
+        "rice bowl", "wrap", "sandwich", "shawarma", "kebab", "taco", "tacos",
+        "salad", "soup", "fries", "dessert", "cake", "ice cream", "sweet"
+    ]
+
+    matched = []
+    for keyword in family_keywords:
+        if keyword in text:
+            matched.append(keyword)
+
+    if not matched:
+        category = _normalize_family_text(item.get("category", ""))
+        if category:
+            matched.append(category)
+
+    return matched
+
+
+def _is_same_food_family(selected_item, candidate_item):
+    selected_keywords = set(_get_food_family_keywords(selected_item))
+    candidate_keywords = set(_get_food_family_keywords(candidate_item))
+
+    if not selected_keywords or not candidate_keywords:
+        return False
+
+    return bool(selected_keywords.intersection(candidate_keywords))
+
+
+def _find_desserts_for_restaurant(restaurant_id, profile, exclude_menu_ids=None):
+    if not restaurant_id:
+        return []
+
+    exclude_menu_ids = exclude_menu_ids or []
+    regex_names = _get_dessert_terms_regex()
+
+    cursor = menu_collection.find({
+        "restaurant_id": restaurant_id,
+        "available": True,
+        "menu_id": {"$nin": exclude_menu_ids},
+        "$or": [
+            {"category": {"$regex": "dessert", "$options": "i"}},
+            {"tags": {"$elemMatch": {"$regex": "dessert", "$options": "i"}}},
+            {"food_name": {"$regex": regex_names, "$options": "i"}}
+        ]
+    }).limit(20)
+
+    dessert_items = []
+    for item in cursor:
+        try:
+            if item.get("_id") is not None:
+                item["_id"] = str(item["_id"])
+        except Exception:
+            pass
+        dessert_items.append(item)
+
+    dessert_items = [
+        item for item in dessert_items
+        if is_dietary_safe(item, profile.get("preferences", {}))
+    ]
+
+    return dessert_items
+
+
+def _find_global_dessert_recommendations(user_id, relax_dietary=False):
+    return recommend_foods(user_id, "dessert", relax_dietary=relax_dietary)
+
+
+def _find_nearby_dessert_recommendations(lat, lng, profile, relax_dietary=False):
+    preferences = profile.get("preferences", {})
+    seen_menu_ids = set()
+    collected = []
+
+    for query in ["dessert", "sweet", "cake", "ice cream", "pudding", "brownie", "pastry", "fruit dessert"]:
+        for item in get_location_based_menus(lat, lng, query):
+            menu_id = str(item.get("menu_id", ""))
+            if not menu_id or menu_id in seen_menu_ids:
+                continue
+            seen_menu_ids.add(menu_id)
+
+            if not relax_dietary and not is_dietary_safe(item, preferences):
+                continue
+
+            collected.append(item)
+
+    return collected[:5]
+
+
+def _build_dessert_fallback(user_id, profile, restaurant_id=None, lat=None, lng=None):
+    preferences = profile.get("preferences", {})
+    allergies = preferences.get("allergies", [])
+
+    if restaurant_id:
+        dessert_items = _find_desserts_for_restaurant(restaurant_id, profile)
+        if not dessert_items:
+            dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
+    elif lat is not None and lng is not None:
+        dessert_items = _find_nearby_dessert_recommendations(lat, lng, profile)
+        if not dessert_items:
+            dessert_items = _find_nearby_dessert_recommendations(lat, lng, profile, relax_dietary=True)
+    else:
+        dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
+
+    if not dessert_items:
+        return None
+
+    dessert_recommendations = dessert_items[:5]
+    options_text, options_map = format_options(dessert_recommendations)
+    recommendation_batch_id = uuid4().hex
+
+    save_options(
+        user_id,
+        options_map,
+        original_query="dessert_fallback",
+        recommendation_batch_id=recommendation_batch_id
+    )
+
+    ai_response = generate_recommendation_response(
+        "I could not find a matching main dish for your preferences, so here are dessert options instead:",
+        dessert_recommendations,
+        user_preferences=preferences
+    )
+
+    return {
+        "options_text": options_text,
+        "recommendation_batch_id": recommendation_batch_id,
+        "ai_response": ai_response,
+        "recommendations": dessert_recommendations,
+        "allergies": allergies
+    }
+
+
+def _send_dessert_recommendation(user_id, restaurant_id, chat_session_id, profile, prompt_message):
+    dessert_items = _find_desserts_for_restaurant(restaurant_id, profile)
+    if not dessert_items:
+        dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
+
+    if not dessert_items:
+        return None
+
+    dessert_recs = dessert_items[:5]
+    ai_reco = generate_recommendation_response(
+        prompt_message,
+        dessert_recs,
+        user_preferences=profile.get("preferences", {})
+    )
+
+    dessert_batch_id = uuid4().hex
+    save_last_instruction_context(user_id, restaurant_id)
+
+    try:
+        _, options_map = format_options(dessert_recs)
+        save_options(
+            user_id,
+            options_map,
+            original_query=f"dessert_fallback:{restaurant_id}",
+            recommendation_batch_id=dessert_batch_id
+        )
+        save_last_blocked_items(user_id, [])
+    except Exception:
+        pass
+
+    return {
+        "intent": "chat",
+        "state": "dessert_suggestion",
+        "message": ai_reco["response"],
+        "recommendations": dessert_recs,
+        "ai_response": ai_reco,
+        "restaurant_id": restaurant_id,
+        "recommendation_batch_id": dessert_batch_id
+    }
 
 
 def _looks_like_dessert_item(item):
@@ -251,9 +449,13 @@ def ai_recommend(user_id: str, food: str):
 
     recommendations = recommend_foods(user_id, food)
 
+    user_profile = get_user_profile(user_id)
+    preferences = user_profile.get("preferences", {})
+
     ai_response = generate_recommendation_response(
         food,
-        recommendations
+        recommendations,
+        user_preferences=preferences
     )
 
     return {
@@ -380,7 +582,7 @@ def hybrid_search(query: str, top_k: int = 5, cuisine: str = None, max_price: fl
 
 
 @app.post("/chat")
-def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_session_id: str = None):
+def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_session_id: str = None, recommendation_batch_id: str = None):
 
     intent = detect_intent(message)
     state = get_state(user_id)
@@ -404,15 +606,17 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                 "message": ingredient_reply
             }
 
-        # dessert follow-up: user says "No thanks" to prompt the instruction card
+        # dessert follow-up: if the user rejects the current recommendation in cart state,
+        # fall back to dessert recommendations first. Only show the instruction card after
+        # dessert suggestions have been offered.
         if _is_no_thanks_message(message):
             restaurant_id = get_last_instruction_context(user_id)
-            if restaurant_id:
+            add_message(user_id, "user", message, chat_session_id)
+
+            if state == "dessert_suggestion" and restaurant_id:
                 prompt_msg = (
                     "Add any special requests or dietary notes below to customize your order!"
                 )
-
-                add_message(user_id, "user", message, chat_session_id)
                 add_message(user_id, "assistant", prompt_msg, chat_session_id)
                 set_state(user_id, "instruction_prompt")
 
@@ -424,6 +628,19 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                     "restaurant_id": restaurant_id
                 }
 
+            if state == "cart" and restaurant_id:
+                dessert_result = _send_dessert_recommendation(
+                    user_id,
+                    restaurant_id,
+                    chat_session_id,
+                    profile,
+                    "I understand you would rather skip the previous suggestions. Here are dessert options from the same restaurant:"
+                )
+                if dessert_result:
+                    add_message(user_id, "assistant", dessert_result["message"], chat_session_id)
+                    set_state(user_id, "dessert_suggestion")
+                    return dessert_result
+
         # regular chat: get AI reply and detect any extracted preference updates
         ai_result = chat_with_ai(user_id, message)
         ai_response = ai_result.get("response") if isinstance(ai_result, dict) else ai_result
@@ -431,6 +648,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
 
         # If the user just updated allergies, attempt to auto-refresh last saved recommendations
         refreshed_recommendations = None
+        refreshed_recommendations_batch_id = None
         try:
             if extracted and extracted.get("allergies"):
                 from service.memory import get_last_saved_query
@@ -441,7 +659,13 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                     # persist options for UI selection after auto-refresh
                     try:
                         options_text, options_map = format_options(refreshed_recommendations)
-                        save_options(user_id, options_map, original_query=last_query)
+                        refreshed_recommendations_batch_id = uuid4().hex
+                        save_options(
+                            user_id,
+                            options_map,
+                            original_query=last_query,
+                            recommendation_batch_id=refreshed_recommendations_batch_id
+                        )
                         save_last_blocked_items(user_id, [])
                     except Exception:
                         pass
@@ -458,6 +682,8 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
 
         if refreshed_recommendations:
             resp["recommendations"] = refreshed_recommendations
+            if refreshed_recommendations_batch_id:
+                resp["recommendation_batch_id"] = refreshed_recommendations_batch_id
 
         return resp
 
@@ -496,6 +722,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                 recommendations,
                 allergies
             )
+            recommendations = [item for item in (recommendations or []) if is_dietary_safe(item, profile.get("preferences", {}))]
 
         else:
 
@@ -522,7 +749,27 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
 
         if not recommendations or len(recommendations) == 0:
 
-            error_msg = "Sorry, no matching food is available in nearby restaurants."
+            # If no personalized food match is found, business policy: offer dessert instead.
+            dessert_bundle = _build_dessert_fallback(user_id, profile, lat=lat, lng=lng)
+            if dessert_bundle:
+                disclaimer = _build_allergy_disclaimer(blocked_items, allergies)
+                if disclaimer:
+                    dessert_bundle["ai_response"]["response"] = f"{dessert_bundle['ai_response']['response']}\n\n{disclaimer}"
+
+                add_message(user_id, "assistant", dessert_bundle["ai_response"]["response"], chat_session_id)
+
+                set_state(user_id, "dessert_suggestion")
+
+                return {
+                    "intent": intent,
+                    "state": "dessert_suggestion",
+                    "options": dessert_bundle["options_text"],
+                    "ai_response": dessert_bundle["ai_response"],
+                    "recommendations": dessert_bundle["recommendations"],
+                    "recommendation_batch_id": dessert_bundle["recommendation_batch_id"]
+                }
+
+            error_msg = "I couldn't find a matching main dish right now, so I can try dessert options instead."
             disclaimer = _build_allergy_disclaimer(blocked_items, allergies)
             if disclaimer:
                 error_msg = f"{error_msg} {disclaimer}"
@@ -534,21 +781,23 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                 "message": error_msg
             }
         # CREATE OPTIONS
-        options_text, options_map = format_options(
-            recommendations
-        )
+        options_text, options_map = format_options(recommendations)
+
+        recommendation_batch_id = uuid4().hex
 
         # SAVE OPTIONS (store original query to allow auto-refresh later)
         save_options(
             user_id,
             options_map,
-            original_query=message
+            original_query=message,
+            recommendation_batch_id=recommendation_batch_id
         )
 
         # AI RESPONSE
         ai_response = generate_recommendation_response(
             message,
-            recommendations
+            recommendations,
+            user_preferences=profile.get("preferences", {})
         )
 
         disclaimer = _build_allergy_disclaimer(blocked_items, allergies)
@@ -568,7 +817,8 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
             "state": "browsing",
             "options": options_text,
             "ai_response": ai_response,
-            "recommendations": recommendations
+            "recommendations": recommendations,
+            "recommendation_batch_id": recommendation_batch_id
         }
 
     # -------------------------
@@ -576,7 +826,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
     # -------------------------
     if intent == "select":
 
-        options = get_options(user_id)
+        options = get_options(user_id, recommendation_batch_id)
 
         option_key, quantity = parse_option_selection(message)
         selected = options.get(option_key)
@@ -667,45 +917,57 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                         "restaurant_id": restaurant_id  
                     }
 
-                # After adding to cart, proactively suggest desserts / cold items
+                # After adding to cart, first try to suggest other available categories from the same restaurant
                 try:
                     restaurant_id = selected_item.get("restaurant_id")
+                    selected_category = (selected_item.get("category") or "").strip()
 
-                    # prefer desserts from the same restaurant only
-                    regex_names = r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|dessert"
-                    cursor = menu_collection.find({
+                    other_cursor = menu_collection.find({
                         "restaurant_id": restaurant_id,
                         "available": True,
+                        "menu_id": {"$ne": selected_item.get("menu_id")},
                         "$or": [
-                            {"category": {"$regex": "dessert", "$options": "i"}},
-                            {"tags": {"$elemMatch": {"$regex": "dessert", "$options": "i"}}},
-                            {"food_name": {"$regex": regex_names, "$options": "i"}}
+                            {"category": {"$ne": selected_category}},
+                            {"category": {"$exists": False}}
                         ]
-                    }).limit(10)
+                    }).limit(15)
 
-                    dessert_items = []
-                    for d in cursor:
-                        # convert ObjectId fields to strings for JSON safety
+                    other_items = []
+                    for d in other_cursor:
                         try:
                             if d.get("_id") is not None:
                                 d["_id"] = str(d["_id"])
                         except Exception:
                             pass
-                        dessert_items.append(d)
+                        other_items.append(d)
 
-                    # only show restaurant-specific desserts by default
-                    if dessert_items:
-                        # prepare AI recommendation text for desserts
-                        dessert_recs = dessert_items[:5]
-                        ai_reco = generate_recommendation_response("Here are some desserts and cold items from the same restaurant:", dessert_recs)
+                    other_items = [item for item in other_items if is_dietary_safe(item, profile.get("preferences", {}))]
+                    other_items = [item for item in other_items if not _is_same_food_family(selected_item, item)]
+                    non_dessert_items = [item for item in other_items if not _looks_like_dessert_item(item)]
+                    if non_dessert_items:
+                        other_items = non_dessert_items
+                    else:
+                        other_items = []
 
-                        # remember the restaurant context so a later "No thanks" can open the instruction card
+                    if other_items:
+                        other_recs = other_items[:5]
+                        ai_reco = generate_recommendation_response(
+                            "I also found these other dishes from different categories in the same restaurant:",
+                            other_recs,
+                            user_preferences=profile.get("preferences", {})
+                        )
+
+                        other_batch_id = uuid4().hex
                         save_last_instruction_context(user_id, restaurant_id)
 
-                        # persist options so UI reflects new choices
                         try:
-                            _, options_map = format_options(dessert_recs)
-                            save_options(user_id, options_map, original_query=f"dessert_suggestion:{restaurant_id}")
+                            _, options_map = format_options(other_recs)
+                            save_options(
+                                user_id,
+                                options_map,
+                                original_query=f"other_category_suggestion:{restaurant_id}",
+                                recommendation_batch_id=other_batch_id
+                            )
                             save_last_blocked_items(user_id, [])
                         except Exception:
                             pass
@@ -718,12 +980,72 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                             "state": "cart",
                             "message": full_msg,
                             "cart": cart,
-                            "recommendations": dessert_recs,
+                            "recommendations": other_recs,
                             "ai_response": ai_reco,
-                            "restaurant_id": restaurant_id
+                            "restaurant_id": restaurant_id,
+                            "recommendation_batch_id": other_batch_id
                         }
 
-                    # if no restaurant-specific desserts found, do not auto-suggest others by default
+                    regex_names = r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|dessert"
+                    cursor = menu_collection.find({
+                        "restaurant_id": restaurant_id,
+                        "available": True,
+                        "menu_id": {"$ne": selected_item.get("menu_id")},
+                        "$or": [
+                            {"category": {"$regex": "dessert", "$options": "i"}},
+                            {"tags": {"$elemMatch": {"$regex": "dessert", "$options": "i"}}},
+                            {"food_name": {"$regex": regex_names, "$options": "i"}}
+                        ]
+                    }).limit(10)
+
+                    dessert_items = []
+                    for d in cursor:
+                        try:
+                            if d.get("_id") is not None:
+                                d["_id"] = str(d["_id"])
+                        except Exception:
+                            pass
+                        dessert_items.append(d)
+
+                    dessert_items = [item for item in dessert_items if is_dietary_safe(item, profile.get("preferences", {}))]
+
+                    if dessert_items:
+                        dessert_recs = dessert_items[:5]
+                        ai_reco = generate_recommendation_response(
+                            "Here are some desserts and cold items from the same restaurant:",
+                            dessert_recs,
+                            user_preferences=profile.get("preferences", {})
+                        )
+
+                        dessert_batch_id = uuid4().hex
+                        save_last_instruction_context(user_id, restaurant_id)
+
+                        try:
+                            _, options_map = format_options(dessert_recs)
+                            save_options(
+                                user_id,
+                                options_map,
+                                original_query=f"dessert_suggestion:{restaurant_id}",
+                                recommendation_batch_id=dessert_batch_id
+                            )
+                            save_last_blocked_items(user_id, [])
+                        except Exception:
+                            pass
+
+                        full_msg = f"{success_msg}\n\n{ai_reco['response']}"
+                        add_message(user_id, "assistant", full_msg, chat_session_id)
+
+                        return {
+                            "intent": intent,
+                            "state": "dessert_suggestion",
+                            "message": full_msg,
+                            "cart": cart,
+                            "recommendations": dessert_recs,
+                            "ai_response": ai_reco,
+                            "restaurant_id": restaurant_id,
+                            "recommendation_batch_id": dessert_batch_id
+                        }
+
                 except Exception:
                     # fallback: still return success message
                     pass

@@ -2,6 +2,7 @@ from datetime import datetime
 import re
 from uuid import uuid4
 
+from service.ai.preference_extraction_service import extract_preferences
 from service.data.database_service import user_profile_collection
 
 
@@ -80,6 +81,33 @@ def _merge_unique_case_insensitive(items):
         merged.append(item)
 
     return merged
+
+
+def _normalize_dietary_preferences(onboarding_data):
+    selected_restrictions = _normalize_list(onboarding_data.get("dietary_restrictions"))
+    dietary_note = str(onboarding_data.get("dietary_note", "") or "").strip()
+
+    extracted_restrictions = []
+    extracted_style = ""
+
+    if dietary_note:
+        extracted = extract_preferences(dietary_note)
+        extracted_restrictions = _normalize_list(extracted.get("dietary_restrictions", []))
+        extracted_style = str(extracted.get("dietary_style", "") or "").strip()
+
+        if not extracted_restrictions and extracted_style:
+            extracted_restrictions = [extracted_style]
+
+    merged_restrictions = _merge_unique_case_insensitive(selected_restrictions + extracted_restrictions)
+
+    if extracted_style:
+        dietary_style = extracted_style
+    elif merged_restrictions:
+        dietary_style = merged_restrictions[0]
+    else:
+        dietary_style = ""
+
+    return dietary_style, merged_restrictions
 
 
 def _normalize_address(address, default_label="Home", address_id=None, is_default=False):
@@ -379,13 +407,14 @@ def save_onboarding_profile(user_id, onboarding_data):
 
     delivery_address = onboarding_data.get("delivery_address", {}) or {}
     cleaned_address = _normalize_address(delivery_address, default_label=delivery_address.get("address_type") or "Home", is_default=True)
+    dietary_style, dietary_restrictions = _normalize_dietary_preferences(onboarding_data)
 
     update_user_preferences(
         user_id,
         {
             "preferred_cuisines": _normalize_list(onboarding_data.get("preferred_cuisines")),
-            "dietary_style": ", ".join(_normalize_list(onboarding_data.get("dietary_restrictions"))),
-            "dietary_restrictions": _normalize_list(onboarding_data.get("dietary_restrictions")),
+            "dietary_style": dietary_style,
+            "dietary_restrictions": dietary_restrictions,
             "budget_range": str(onboarding_data.get("budget_range", "")).strip(),
             "preferred_meal_time": _normalize_list(onboarding_data.get("preferred_meal_time")),
             "order_frequency": str(onboarding_data.get("order_frequency", "")).strip(),

@@ -1,8 +1,42 @@
+from openai import OpenAI
+from dotenv import load_dotenv
+import os
+import json
+
 from service.data.profile_service import get_user_profile
 import re
 from difflib import SequenceMatcher
 
 from service.business.restaurant_service import hybrid_food_search
+
+load_dotenv()
+
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
+_DIETARY_QUERY_TERMS = {
+    "vegan",
+    "vegetarian",
+    "plant-based",
+    "plant based",
+    "meatless",
+    "no meat",
+    "no-meat",
+    "veggie",
+    "halal",
+    "kosher",
+    "gluten-free",
+    "gluten free",
+    "dairy-free",
+    "dairy free",
+    "nut-free",
+    "nut free",
+    "keto",
+    "paleo",
+    "low-carb",
+    "low carb"
+}
 
 
 def _normalize_token(value):
@@ -120,6 +154,246 @@ def filter_allergy_safe_foods(menu_items, allergies):
         safe_items.append(item)
 
     return safe_items, blocked_items
+
+
+def _normalize_text(value):
+    return re.sub(r"[^a-z0-9 ]", " ", str(value or "").lower()).strip()
+
+
+def _dedupe_preserve_order(values):
+    deduped = []
+    seen = set()
+
+    for value in values or []:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            continue
+
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+
+    return deduped
+
+
+def _is_dietary_query(query):
+    normalized = _normalize_text(query)
+    if not normalized:
+        return False
+
+    if normalized in _DIETARY_QUERY_TERMS:
+        return True
+
+    return any(term in normalized for term in _DIETARY_QUERY_TERMS)
+
+
+def _expand_search_queries_with_ai(food_query, preferences):
+    dietary_style = str((preferences or {}).get("dietary_style", "") or "").strip()
+    dietary_restrictions = (preferences or {}).get("dietary_restrictions", []) or []
+    preferred_cuisines = (preferences or {}).get("preferred_cuisines", []) or []
+
+    prompt = f"""
+    Generate 5 short food search queries that can match real restaurant menu items.
+
+    Return ONLY valid JSON as an array of strings.
+
+    User request: {food_query}
+    Dietary style: {dietary_style or 'none'}
+    Dietary restrictions: {', '.join(dietary_restrictions) or 'none'}
+    Preferred cuisines: {', '.join(preferred_cuisines) or 'none'}
+
+    Rules:
+    - Prefer broad menu terms that restaurants actually use.
+    - If the user request is mainly dietary, translate it into dish categories instead of repeating the diet label.
+    - Keep each query short, natural, and searchable.
+    - Do not include explanations, numbering, or markdown.
+    - Do not repeat the exact same phrase more than once.
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You generate short food search queries for a restaurant recommender."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.2
+        )
+
+        content = response.choices[0].message.content or ""
+        parsed = json.loads(content)
+
+        if isinstance(parsed, str):
+            parsed = [parsed]
+
+        if not isinstance(parsed, list):
+            return []
+
+        queries = [str(item).strip() for item in parsed if str(item).strip()]
+        return _dedupe_preserve_order([food_query] + queries)
+    except Exception:
+        fallback_queries = [
+            food_query,
+            "vegetable bowl",
+            "mixed vegetables",
+            "rice bowl",
+            "salad",
+            "tofu",
+            "lentil curry",
+            "grilled vegetables"
+        ]
+
+        if _is_dietary_query(food_query):
+            return _dedupe_preserve_order(fallback_queries)
+
+        return [food_query]
+
+
+def _search_food_candidates(food_query, preferences):
+    queries = [food_query]
+
+    if _is_dietary_query(food_query):
+        queries = _expand_search_queries_with_ai(food_query, preferences)
+
+    combined = []
+    seen_ids = set()
+
+    for query in queries:
+        for item in hybrid_food_search(query):
+            menu_id = str(item.get("menu_id", ""))
+            if not menu_id or menu_id in seen_ids:
+                continue
+            seen_ids.add(menu_id)
+            combined.append(item)
+
+    return combined
+
+
+def _gather_menu_text(item):
+    parts = []
+    parts.append(item.get("food_name", ""))
+    parts.append(item.get("category", ""))
+    parts.extend(item.get("tags", []) or [])
+    parts.extend(item.get("ingredients", []) or [])
+    parts.append(item.get("description", ""))
+    return _normalize_text(" ".join(str(p) for p in parts if p))
+
+
+def _contains_keywords(item, keywords):
+    text = _gather_menu_text(item)
+    return any(keyword in text for keyword in keywords if keyword)
+
+
+def _is_diet_vegan_safe(item):
+    text = _gather_menu_text(item)
+    vegan_blacklist = [
+        "beef", "chicken", "pork", "lamb", "mutton", "shrimp", "prawns",
+        "fish", "salmon", "tuna", "crab", "lobster", "oyster", "mussel",
+        "clams", "shellfish", "egg", "cheese", "milk", "yogurt", "cream",
+        "butter", "ghee", "paneer", "honey", "gelatin", "mayonnaise", "milkshake"
+    ]
+    if any(term in text for term in vegan_blacklist):
+        return False
+    if "vegan" in text:
+        return True
+    # If the item is a burger or kebab and not explicitly vegan, reject as unsafe.
+    if any(term in text for term in ["burger", "kebab", "sausage", "steak", "ribs"]):
+        return False
+    return True
+
+
+def _is_diet_vegetarian_safe(item):
+    text = _gather_menu_text(item)
+    vegetarian_blacklist = [
+        "beef", "chicken", "pork", "lamb", "mutton", "shrimp", "prawns",
+        "fish", "salmon", "tuna", "crab", "lobster", "oyster", "mussel",
+        "clams", "shellfish"
+    ]
+    if any(term in text for term in vegetarian_blacklist):
+        return False
+    return True
+
+
+def _is_diet_gluten_free_safe(item):
+    text = _gather_menu_text(item)
+    gluten_blacklist = ["wheat", "barley", "rye", "malt", "semolina", "spelt", "pasta", "breadcrumbs", "bread", "flour"]
+    return not any(term in text for term in gluten_blacklist)
+
+
+def _is_diet_dairy_free_safe(item):
+    text = _gather_menu_text(item)
+    dairy_blacklist = ["milk", "cheese", "yogurt", "cream", "butter", "paneer", "ghee", "ice cream", "custard"]
+    return not any(term in text for term in dairy_blacklist)
+
+
+def _is_diet_halal_safe(item):
+    text = _gather_menu_text(item)
+    halal_blacklist = ["pork", "ham", "bacon", "alcohol", "wine", "beer", "whiskey", "vodka"]
+    if any(term in text for term in halal_blacklist):
+        return False
+    return True
+
+
+def _is_restriction_safe(item, restriction):
+    if not restriction:
+        return True
+    normalized = str(restriction).lower().strip()
+    if normalized in {"vegan", "vegetarian", "halal", "kosher", "gluten-free", "gluten free", "dairy-free", "dairy free", "low-carb", "keto", "paleo"}:
+        if normalized == "vegan":
+            return _is_diet_vegan_safe(item)
+        if normalized == "vegetarian":
+            return _is_diet_vegetarian_safe(item)
+        if normalized == "halal":
+            return _is_diet_halal_safe(item)
+        if normalized == "kosher":
+            # Kosher filtering is best-effort based on meat + dairy mixing; if a kosher tag exists, accept.
+            text = _gather_menu_text(item)
+            if "kosher" in text:
+                return True
+            return not any(term in text for term in ["pork", "shellfish", "shrimp", "crab", "ham", "bacon"])
+        if normalized in {"gluten-free", "gluten free"}:
+            return _is_diet_gluten_free_safe(item)
+        if normalized in {"dairy-free", "dairy free"}:
+            return _is_diet_dairy_free_safe(item)
+        if normalized == "low-carb":
+            text = _gather_menu_text(item)
+            return not any(term in text for term in ["bread", "pasta", "rice", "potato", "fries", "brioche", "bun"])
+        if normalized == "keto":
+            text = _gather_menu_text(item)
+            return not any(term in text for term in ["bread", "pasta", "rice", "sugar", "corn", "potato", "flour"])
+        if normalized == "paleo":
+            text = _gather_menu_text(item)
+            return not any(term in text for term in ["bread", "pasta", "rice", "dairy", "beans", "lentils", "sugar"])
+    return True
+
+
+def is_dietary_safe(menu_item, preferences):
+    if not preferences:
+        return True
+
+    style = str(preferences.get("dietary_style", "") or "").lower().strip()
+    restrictions = [str(r).lower().strip() for r in (preferences.get("dietary_restrictions", []) or []) if str(r).strip()]
+
+    # If dietary_style duplicates restrictions, keep unique values
+    if style and style not in restrictions:
+        restrictions.insert(0, style)
+
+    if not restrictions:
+        return True
+
+    for restriction in restrictions:
+        if not _is_restriction_safe(menu_item, restriction):
+            return False
+
+    return True
 
 
 def calculate_score(menu_item, preferences):
@@ -263,7 +537,7 @@ def calculate_score(menu_item, preferences):
     return score
 
 
-def recommend_foods(user_id, food_query):
+def recommend_foods(user_id, food_query, relax_dietary=False):
 
     user_profile = get_user_profile(
         user_id
@@ -279,8 +553,9 @@ def recommend_foods(user_id, food_query):
         []
     )
 
-    candidate_foods = hybrid_food_search(
-        food_query
+    candidate_foods = _search_food_candidates(
+        food_query,
+        preferences
     )
 
     ranked_foods = []
@@ -288,6 +563,9 @@ def recommend_foods(user_id, food_query):
     for item in candidate_foods:
 
         if not _is_allergy_safe(item, allergies):
+            continue
+
+        if not relax_dietary and not is_dietary_safe(item, preferences):
             continue
 
         score = calculate_score(

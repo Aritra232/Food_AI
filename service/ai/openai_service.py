@@ -49,13 +49,13 @@ Safety rule:
 - If asked for a recommendation that includes an allergen, propose safer alternatives.
 """
 
-def chat_with_ai(user_id, user_message):
+def chat_with_ai(user_id, user_message, chat_session_id=None):
 
     profile = get_user_profile(user_id)
 
     extracted_preferences = extract_preferences(
         user_message,
-        conversation_history=get_conversation(user_id),
+        conversation_history=get_conversation(user_id, chat_session_id),
         existing_allergies=profile.get("preferences", {}).get("allergies", [])
     )
 
@@ -65,7 +65,7 @@ def chat_with_ai(user_id, user_message):
         source_message=user_message
     )
 
-    conversation = get_conversation(user_id)
+    conversation = get_conversation(user_id, chat_session_id)
 
     messages = [
         {
@@ -88,9 +88,9 @@ def chat_with_ai(user_id, user_message):
 
     ai_response = response.choices[0].message.content
 
-    add_message(user_id, "user", user_message)
+    add_message(user_id, "user", user_message, chat_session_id)
 
-    add_message(user_id, "assistant", ai_response)
+    add_message(user_id, "assistant", ai_response, chat_session_id)
 
     return {
         "response": ai_response,

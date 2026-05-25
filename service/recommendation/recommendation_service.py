@@ -8,6 +8,7 @@ import re
 from difflib import SequenceMatcher
 
 from service.business.restaurant_service import hybrid_food_search
+from service.business.location_service import get_nearby_restaurants
 
 load_dotenv()
 
@@ -537,7 +538,7 @@ def calculate_score(menu_item, preferences):
     return score
 
 
-def recommend_foods(user_id, food_query, relax_dietary=False):
+def recommend_foods(user_id, food_query, relax_dietary=False, lat=None, lng=None):
 
     user_profile = get_user_profile(
         user_id
@@ -557,6 +558,22 @@ def recommend_foods(user_id, food_query, relax_dietary=False):
         food_query,
         preferences
     )
+
+    if lat is not None and lng is not None:
+        nearby_restaurants = get_nearby_restaurants(lat, lng)
+        nearby_ids = {
+            str(item.get("restaurant_id", "")).strip()
+            for item in (nearby_restaurants or [])
+            if str(item.get("restaurant_id", "")).strip()
+        }
+
+        if nearby_ids:
+            candidate_foods = [
+                item for item in candidate_foods
+                if str(item.get("restaurant_id", "")).strip() in nearby_ids
+            ]
+        else:
+            candidate_foods = []
 
     ranked_foods = []
 

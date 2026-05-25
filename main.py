@@ -88,6 +88,45 @@ def _get_dessert_terms_regex():
     return r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|pudding|brownie|pastry|gelato|dessert|sweet"
 
 
+def _attach_restaurant_names(items):
+    items = items or []
+    if not items:
+        return []
+
+    restaurant_ids = []
+    seen = set()
+    for item in items:
+        rid = str(item.get("restaurant_id", "")).strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        restaurant_ids.append(rid)
+
+    if not restaurant_ids:
+        return items
+
+    cursor = restaurant_collection.find(
+        {"restaurant_id": {"$in": restaurant_ids}},
+        {"restaurant_id": 1, "name": 1, "restaurant_name": 1}
+    )
+
+    name_map = {}
+    for doc in cursor:
+        rid = str(doc.get("restaurant_id", "")).strip()
+        if not rid:
+            continue
+        name_map[rid] = str(doc.get("name") or doc.get("restaurant_name") or rid).strip()
+
+    enriched = []
+    for item in items:
+        enriched_item = dict(item)
+        rid = str(enriched_item.get("restaurant_id", "")).strip()
+        enriched_item["restaurant_name"] = name_map.get(rid, rid or "Unknown")
+        enriched.append(enriched_item)
+
+    return enriched
+
+
 def _normalize_family_text(value):
     return re.sub(r"[^a-z0-9 ]", " ", str(value or "").lower()).strip()
 
@@ -190,21 +229,21 @@ def _build_dessert_fallback(user_id, profile, restaurant_id=None, lat=None, lng=
     preferences = profile.get("preferences", {})
     allergies = preferences.get("allergies", [])
 
-    if restaurant_id:
-        dessert_items = _find_desserts_for_restaurant(restaurant_id, profile)
-        if not dessert_items:
-            dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
-    elif lat is not None and lng is not None:
+    if lat is not None and lng is not None:
         dessert_items = _find_nearby_dessert_recommendations(lat, lng, profile)
         if not dessert_items:
             dessert_items = _find_nearby_dessert_recommendations(lat, lng, profile, relax_dietary=True)
+    elif restaurant_id:
+        dessert_items = _find_desserts_for_restaurant(restaurant_id, profile)
+        if not dessert_items:
+            dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
     else:
         dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
 
     if not dessert_items:
         return None
 
-    dessert_recommendations = dessert_items[:5]
+    dessert_recommendations = _attach_restaurant_names(dessert_items[:5])
     options_text, options_map = format_options(dessert_recommendations)
     recommendation_batch_id = uuid4().hex
 
@@ -230,15 +269,19 @@ def _build_dessert_fallback(user_id, profile, restaurant_id=None, lat=None, lng=
     }
 
 
-def _send_dessert_recommendation(user_id, restaurant_id, chat_session_id, profile, prompt_message):
-    dessert_items = _find_desserts_for_restaurant(restaurant_id, profile)
-    if not dessert_items:
-        dessert_items = _find_global_dessert_recommendations(user_id, relax_dietary=True)
+def _send_dessert_recommendation(user_id, restaurant_id, chat_session_id, profile, prompt_message, lat=None, lng=None):
+    dessert_bundle = _build_dessert_fallback(
+        user_id,
+        profile,
+        restaurant_id=restaurant_id,
+        lat=lat,
+        lng=lng
+    )
 
-    if not dessert_items:
+    if not dessert_bundle:
         return None
 
-    dessert_recs = dessert_items[:5]
+    dessert_recs = dessert_bundle["recommendations"]
     ai_reco = generate_recommendation_response(
         prompt_message,
         dessert_recs,
@@ -253,7 +296,7 @@ def _send_dessert_recommendation(user_id, restaurant_id, chat_session_id, profil
         save_options(
             user_id,
             options_map,
-            original_query=f"dessert_fallback:{restaurant_id}",
+            original_query=f"dessert_fallback:{restaurant_id or 'nearby'}",
             recommendation_batch_id=dessert_batch_id
         )
         save_last_blocked_items(user_id, [])
@@ -437,17 +480,19 @@ def semantic_search(food: str):
 # RECOMMENDATION (raw)
 # -------------------------
 @app.get("/recommend-food")
-def recommend(user_id: str, food: str):
-    return recommend_foods(user_id, food)
+def recommend(user_id: str, food: str, lat: float = None, lng: float = None):
+    recommendations = recommend_foods(user_id, food, lat=lat, lng=lng)
+    return _attach_restaurant_names(recommendations)
 
 
 # -------------------------
 # AI RECOMMENDATION
 # -------------------------
 @app.get("/ai-recommend")
-def ai_recommend(user_id: str, food: str):
+def ai_recommend(user_id: str, food: str, lat: float = None, lng: float = None):
 
-    recommendations = recommend_foods(user_id, food)
+    recommendations = recommend_foods(user_id, food, lat=lat, lng=lng)
+    recommendations = _attach_restaurant_names(recommendations)
 
     user_profile = get_user_profile(user_id)
     preferences = user_profile.get("preferences", {})
@@ -634,7 +679,9 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                     restaurant_id,
                     chat_session_id,
                     profile,
-                    "I understand you would rather skip the previous suggestions. Here are dessert options from the same restaurant:"
+                    "I understand you would rather skip the previous suggestions. Here are nearby dessert options:",
+                    lat=lat,
+                    lng=lng
                 )
                 if dessert_result:
                     add_message(user_id, "assistant", dessert_result["message"], chat_session_id)
@@ -642,50 +689,17 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                     return dessert_result
 
         # regular chat: get AI reply and detect any extracted preference updates
-        ai_result = chat_with_ai(user_id, message)
+        ai_result = chat_with_ai(user_id, message, chat_session_id=chat_session_id)
         ai_response = ai_result.get("response") if isinstance(ai_result, dict) else ai_result
         extracted = ai_result.get("extracted_preferences") if isinstance(ai_result, dict) else {}
 
-        # If the user just updated allergies, attempt to auto-refresh last saved recommendations
-        refreshed_recommendations = None
-        refreshed_recommendations_batch_id = None
-        try:
-            if extracted and extracted.get("allergies"):
-                from service.memory import get_last_saved_query
-
-                last_query = get_last_saved_query(user_id)
-                if last_query:
-                    refreshed_recommendations = recommend_foods(user_id, last_query)
-                    # persist options for UI selection after auto-refresh
-                    try:
-                        options_text, options_map = format_options(refreshed_recommendations)
-                        refreshed_recommendations_batch_id = uuid4().hex
-                        save_options(
-                            user_id,
-                            options_map,
-                            original_query=last_query,
-                            recommendation_batch_id=refreshed_recommendations_batch_id
-                        )
-                        save_last_blocked_items(user_id, [])
-                    except Exception:
-                        pass
-        except Exception:
-            refreshed_recommendations = None
-
         set_state(user_id, "chat")
 
-        resp = {
+        return {
             "intent": intent,
             "state": "chat",
             "message": ai_response
         }
-
-        if refreshed_recommendations:
-            resp["recommendations"] = refreshed_recommendations
-            if refreshed_recommendations_batch_id:
-                resp["recommendation_batch_id"] = refreshed_recommendations_batch_id
-
-        return resp
 
 
     
@@ -730,19 +744,31 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                 user_id,
                 message
             )
+            recommendations = _attach_restaurant_names(recommendations)
 
         if not recommendations or len(recommendations) == 0:
 
-            # Fallback to global recommendation search so Pinecone + Mongo can still return options
-            recommendations = recommend_foods(
-                user_id,
-                message
-            )
+            if lat and lng:
+                recommendations = recommend_foods(
+                    user_id,
+                    message,
+                    lat=lat,
+                    lng=lng
+                )
+            else:
+                # Fallback to global recommendation search so Pinecone + Mongo can still return options
+                recommendations = recommend_foods(
+                    user_id,
+                    message
+                )
+            recommendations = _attach_restaurant_names(recommendations)
 
             # Try to include blocked list for disclaimer context when coming from location search.
             if not blocked_items and lat and lng:
                 location_recommendations = get_location_based_menus(lat, lng, message)
                 _, blocked_items = filter_allergy_safe_foods(location_recommendations, allergies)
+
+        recommendations = _attach_restaurant_names(recommendations)
 
         if blocked_items:
             save_last_blocked_items(user_id, blocked_items)
@@ -950,7 +976,7 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                         other_items = []
 
                     if other_items:
-                        other_recs = other_items[:5]
+                        other_recs = _attach_restaurant_names(other_items[:5])
                         ai_reco = generate_recommendation_response(
                             "I also found these other dishes from different categories in the same restaurant:",
                             other_recs,
@@ -986,33 +1012,18 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
                             "recommendation_batch_id": other_batch_id
                         }
 
-                    regex_names = r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|dessert"
-                    cursor = menu_collection.find({
-                        "restaurant_id": restaurant_id,
-                        "available": True,
-                        "menu_id": {"$ne": selected_item.get("menu_id")},
-                        "$or": [
-                            {"category": {"$regex": "dessert", "$options": "i"}},
-                            {"tags": {"$elemMatch": {"$regex": "dessert", "$options": "i"}}},
-                            {"food_name": {"$regex": regex_names, "$options": "i"}}
-                        ]
-                    }).limit(10)
+                    dessert_bundle = _build_dessert_fallback(
+                        user_id,
+                        profile,
+                        restaurant_id=restaurant_id,
+                        lat=lat,
+                        lng=lng
+                    )
 
-                    dessert_items = []
-                    for d in cursor:
-                        try:
-                            if d.get("_id") is not None:
-                                d["_id"] = str(d["_id"])
-                        except Exception:
-                            pass
-                        dessert_items.append(d)
-
-                    dessert_items = [item for item in dessert_items if is_dietary_safe(item, profile.get("preferences", {}))]
-
-                    if dessert_items:
-                        dessert_recs = dessert_items[:5]
+                    if dessert_bundle:
+                        dessert_recs = dessert_bundle["recommendations"]
                         ai_reco = generate_recommendation_response(
-                            "Here are some desserts and cold items from the same restaurant:",
+                            "Here are nearby dessert options based on your location:",
                             dessert_recs,
                             user_preferences=profile.get("preferences", {})
                         )

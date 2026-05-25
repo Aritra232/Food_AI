@@ -905,9 +905,10 @@ def _render_recommendation_batch(batch):
         st.session_state.option_quantities.setdefault(quantity_key, 1)
 
         with st.container():
+            restaurant_label = item.get("restaurant_name") or item.get("restaurant_id", "N/A")
             st.markdown(
                 f"<div class='option-card'><strong>Option {label}:</strong> {item.get('food_name', 'N/A')}<br>"
-                f"<small>₹{item.get('price', 'N/A')} | Restaurant {item.get('restaurant_id', 'N/A')}</small></div>",
+                f"<small>₹{item.get('price', 'N/A')} | Restaurant {restaurant_label}</small></div>",
                 unsafe_allow_html=True
             )
 
@@ -1044,8 +1045,9 @@ def _render_recommendations():
 
             with st.container(border=True):
                 st.markdown(f"**Option {label}: {item.get('food_name', 'N/A')}**")
+                restaurant_label = item.get("restaurant_name") or item.get("restaurant_id", "N/A")
                 st.caption(
-                    f"₹{item.get('price', 'N/A')} | Restaurant {item.get('restaurant_id', 'N/A')}"
+                    f"₹{item.get('price', 'N/A')} | Restaurant {restaurant_label}"
                 )
 
                 col_qty, col_minus, col_plus, col_select, col_add = st.columns([1, 1, 1, 1, 1.4])

@@ -81,6 +81,45 @@ st.markdown("""
         border-radius: 8px;
         margin: 8px 0;
     }
+    .food-chat-container {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        border-radius: 16px;
+        padding: 20px;
+        margin: 15px 0;
+        border: 2px solid #e8ecf1;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    }
+    .food-chat-header {
+        font-size: 20px;
+        font-weight: 700;
+        color: #1f2937;
+        margin-bottom: 16px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .food-chat-message-user {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 12px 16px;
+        border-radius: 12px;
+        margin: 8px 0;
+        width: fit-content;
+        max-width: 80%;
+        margin-left: auto;
+        word-wrap: break-word;
+    }
+    .food-chat-message-ai {
+        background: white;
+        color: #1f2937;
+        padding: 12px 16px;
+        border-radius: 12px;
+        margin: 8px 0;
+        border-left: 4px solid #4CAF50;
+        width: fit-content;
+        max-width: 80%;
+        word-wrap: break-word;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -123,6 +162,18 @@ if "awaiting_order_summary_prompt" not in st.session_state:
     st.session_state.awaiting_order_summary_prompt = False
 if "restaurant_request_created" not in st.session_state:
     st.session_state.restaurant_request_created = None
+
+# ===== FOOD AI CHAT SESSION STATE =====
+if "food_ai_chat_active" not in st.session_state:
+    st.session_state.food_ai_chat_active = False
+if "current_food_item" not in st.session_state:
+    st.session_state.current_food_item = None
+if "food_chat_history" not in st.session_state:
+    st.session_state.food_chat_history = []
+if "food_chat_opened" not in st.session_state:
+    st.session_state.food_chat_opened = False
+if "food_chat_last_processed" not in st.session_state:
+    st.session_state.food_chat_last_processed = ""
 
 # Sidebar - User Settings
 st.sidebar.title("👤 User Settings")
@@ -492,19 +543,27 @@ def _render_onboarding_flow():
     elif step == 3:
         st.markdown("<div class='onboarding-title'>Select Your Budget</div>", unsafe_allow_html=True)
         st.markdown("<div class='onboarding-subtitle'>Choose your preferred spending range.</div>", unsafe_allow_html=True)
-        budget_map = {label: value for label, value, _ in BUDGET_OPTIONS}
-        budget_labels = [label for label, _, _ in BUDGET_OPTIONS]
-        budget_display_map = {label: display for label, _, display in BUDGET_OPTIONS}
-        current_budget_label = next((label for label, value, _ in BUDGET_OPTIONS if value == st.session_state.get("onboarding_budget", "")), budget_labels[0])
-        selected_budget_label = st.radio(
+        budget_options = ["Budget Friendly", "Casual Dining", "Fine Dining", "Premium"]
+        budget_values = ["low", "medium", "high", "premium"]
+        budget_display = ["Under $10", "$10 - $25", "$25 - $50", "$50+"]
+        
+        current_budget = st.session_state.get("onboarding_budget", "")
+        try:
+            current_index = budget_values.index(current_budget) if current_budget in budget_values else 0
+        except:
+            current_index = 0
+        
+        selected_budget_label = st.selectbox(
             "Budget range",
-            budget_labels,
-            index=budget_labels.index(current_budget_label),
-            horizontal=False,
+            budget_options,
+            index=current_index,
+            key="budget_select_step3",
             label_visibility="collapsed"
         )
-        st.session_state.onboarding_budget = budget_map[selected_budget_label]
-        st.caption(f"Selected: {budget_display_map[selected_budget_label]}")
+        
+        selected_index = budget_options.index(selected_budget_label)
+        st.session_state.onboarding_budget = budget_values[selected_index]
+        st.caption(f"Selected: {budget_display[selected_index]}")
         col_back, col_next = st.columns([1, 1.2])
         with col_back:
             if st.button("Back", use_container_width=True):
@@ -518,10 +577,13 @@ def _render_onboarding_flow():
     elif step == 4:
         st.markdown("<div class='onboarding-title'>Delivery Address</div>", unsafe_allow_html=True)
         st.markdown("<div class='onboarding-subtitle'>Where should we deliver your food?</div>", unsafe_allow_html=True)
+        current_addr_type = st.session_state.get("onboarding_address_type", "Home") or "Home"
+        current_index = ADDRESS_TYPE_OPTIONS.index(current_addr_type) if current_addr_type in ADDRESS_TYPE_OPTIONS else 0
         st.session_state.onboarding_address_type = st.radio(
-            "Address type",
+            "Address Type",
             ADDRESS_TYPE_OPTIONS,
-            index=ADDRESS_TYPE_OPTIONS.index(st.session_state.get("onboarding_address_type", "Home") or "Home"),
+            index=current_index,
+            key="address_type_step4",
             horizontal=True,
             label_visibility="collapsed"
         )
@@ -912,7 +974,7 @@ def _render_recommendation_batch(batch):
                 unsafe_allow_html=True
             )
 
-            col_qty, col_minus, col_plus, col_select, col_add = st.columns([1, 1, 1, 1, 1.4])
+            col_qty, col_minus, col_plus, col_select, col_chat, col_add = st.columns([1, 1, 1, 1, 1.2, 1.4])
             col_qty.metric("Qty", qty)
 
             if col_minus.button("-", key=f"minus_{batch_id}_{label}"):
@@ -930,6 +992,14 @@ def _render_recommendation_batch(batch):
                     st.error(error)
                 elif result:
                     st.rerun()
+
+            if col_chat.button("💬 Chat AI", key=f"chat_{batch_id}_{label}"):
+                st.session_state.food_ai_chat_active = True
+                st.session_state.current_food_item = item
+                st.session_state.food_chat_history = []
+                st.session_state.food_chat_opened = False
+                st.session_state.food_chat_last_processed = ""
+                st.rerun()
 
             if col_add.button("Add to cart", key=f"add_{batch_id}_{label}"):
                 selected_message = f"Option {label} x{st.session_state.option_quantities.get(quantity_key, 1)}"
@@ -1104,11 +1174,346 @@ if current_profile and not _profile_is_onboarded(current_profile):
     st.stop()
 
 # Create tabs
-tab1, tab2, tab3 = st.tabs(["💬 Chat", "👤 Profile", "🛒 Cart"])
+tab1, tab2, tab3, tab4 = st.tabs(["🍽️ Food Chat", "💬 Chat", "👤 Profile", "🛒 Cart"])
+
+# ==================== FOOD CHAT TAB ====================
+with tab1:
+    # Check if food AI chat is active
+    if st.session_state.get("food_ai_chat_active"):
+        food_item = st.session_state.get("current_food_item")
+        if food_item:
+            st.markdown("---")
+            st.subheader("💬 AI Food Chat")
+            
+            # Display food details
+            col_food_img, col_food_info = st.columns([1, 2])
+            with col_food_img:
+                st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                border-radius: 12px; padding: 20px; text-align: center; color: white;">
+                        <div style="font-size: 48px; margin-bottom: 10px;">🍽️</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            with col_food_info:
+                st.markdown(f"""
+                    <div style="background: #f9fafb; border-radius: 12px; padding: 16px;">
+                        <div style="font-size: 24px; font-weight: bold; color: #1f2937; margin-bottom: 8px;">
+                            {food_item.get('food_name', 'Unknown')}
+                        </div>
+                        <div style="color: #6b7280; margin-bottom: 12px;">
+                            <b>Price:</b> ₹{food_item.get('price', 'N/A')} | 
+                            <b>Restaurant:</b> {food_item.get('restaurant_name', 'N/A')}
+                        </div>
+                        <div style="color: #6b7280; font-size: 14px;">
+                            <b>Category:</b> {food_item.get('category', 'N/A')}
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Initialize food chat if not opened yet
+            if not st.session_state.get("food_chat_opened"):
+                try:
+                    response = requests.post(
+                        f"{API_BASE_URL}/food-ai-chat",
+                        json={
+                            "user_id": user_id,
+                            "food_item": food_item,
+                            "user_message": None,
+                            "chat_session_id": st.session_state.get("active_chat_session_id")
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        opening_msg = data.get("message", "Hi! How can I help?")
+                        st.session_state.food_chat_history = [
+                            {"role": "assistant", "content": opening_msg}
+                        ]
+                        st.session_state.food_chat_opened = True
+                except Exception as e:
+                    st.error(f"Error opening food chat: {str(e)}")
+            
+            # Display food chat history
+            for msg in st.session_state.get("food_chat_history", []):
+                if msg["role"] == "user":
+                    st.markdown(f"""
+                        <div class="user-message">
+                        <b>You:</b> {msg['content']}
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                        <div class="assistant-message">
+                        <b>🤖 AI:</b> {msg['content']}
+                        </div>
+                    """, unsafe_allow_html=True)
+            
+            if "food_chat_input" not in st.session_state:
+                st.session_state.food_chat_input = ""
+
+            user_response = st.session_state.get("food_chat_input", "")
+            last_processed = st.session_state.get("food_chat_last_processed", "")
+
+            def _skip_food_chat():
+                st.session_state.food_ai_chat_active = False
+                st.session_state.current_food_item = None
+                st.session_state.food_chat_history = []
+                st.session_state.food_chat_last_processed = ""
+                st.session_state.food_chat_input = ""
+
+            # Process user response
+            if user_response and user_response != st.session_state.get("food_chat_last_processed", ""):
+                try:
+                    st.session_state.food_chat_last_processed = user_response
+                    with st.spinner("Processing your response..."):
+                        # Send food chat message
+                        food_response = requests.post(
+                            f"{API_BASE_URL}/food-ai-chat",
+                            json={
+                                "user_id": user_id,
+                                "food_item": food_item,
+                                "user_message": user_response,
+                                "chat_session_id": st.session_state.get("active_chat_session_id")
+                            }
+                        )
+                        
+                        if food_response.status_code == 200:
+                            food_data = food_response.json()
+                            ai_msg = food_data.get("message", "I see...")
+                            st.session_state.food_chat_history.append(
+                                {"role": "user", "content": user_response}
+                            )
+                            st.session_state.food_chat_history.append(
+                                {"role": "assistant", "content": ai_msg}
+                            )
+
+                            # If backend already handled ordering, skip extra intent flow.
+                            if food_data.get("status") == "ordered":
+                                st.success("Added to cart!")
+                                next_food = food_data.get("next_food")
+                                next_message = food_data.get("next_message")
+                                if next_message:
+                                    st.session_state.food_chat_history.append(
+                                        {"role": "assistant", "content": next_message}
+                                    )
+                                if next_food:
+                                    st.session_state.current_food_item = next_food
+                                    st.session_state.food_chat_opened = False
+                                    st.session_state.food_chat_last_processed = ""
+                                st.session_state.food_chat_input = ""
+                                st.rerun()
+
+                            # Detect intent only if the assistant replied with a normal chat response.
+                            intent_response = requests.post(
+                                f"{API_BASE_URL}/food-chat-intent",
+                                json={
+                                    "user_id": user_id,
+                                    "user_response": user_response,
+                                    "food_item": food_item,
+                                    "chat_session_id": st.session_state.get("active_chat_session_id")
+                                }
+                            )
+                            
+                            if intent_response.status_code == 200:
+                                intent_data = intent_response.json()
+                                intent = intent_data.get("intent")
+                                quantity = intent_data.get("quantity", 1)
+                                
+                                if intent == "ORDER":
+                                    # Add to cart
+                                    add_response = requests.post(
+                                        f"{API_BASE_URL}/food-ai-order",
+                                        json={
+                                            "user_id": user_id,
+                                            "food_item": food_item,
+                                            "quantity": quantity,
+                                            "chat_session_id": st.session_state.get("active_chat_session_id")
+                                        }
+                                    )
+                                    
+                                    if add_response.status_code == 200:
+                                        order_data = add_response.json()
+                                        success_msg = order_data.get("message", "Added to cart!")
+                                        st.session_state.food_chat_history.append(
+                                            {"role": "assistant", "content": success_msg}
+                                        )
+                                        st.success(success_msg)
+                                        
+                                        # Get next suggestion
+                                        next_response = requests.post(
+                                            f"{API_BASE_URL}/next-food-suggestion",
+                                            params={
+                                                "user_id": user_id,
+                                                "last_food_id": food_item.get("menu_id"),
+                                                "restaurant_id": food_item.get("restaurant_id"),
+                                                "lat": lat,
+                                                "lng": lng,
+                                                "chat_session_id": st.session_state.get("active_chat_session_id")
+                                            }
+                                        )
+                                        
+                                        if next_response.status_code == 200:
+                                            next_data = next_response.json()
+                                            if next_data.get("status") == "suggested":
+                                                suggestion_msg = next_data.get("message", "Want to add something else?")
+                                                next_food = next_data.get("food_item")
+                                                
+                                                st.session_state.food_chat_history.append(
+                                                    {"role": "assistant", "content": suggestion_msg}
+                                                )
+                                                st.session_state.current_food_item = next_food
+                                                st.session_state.food_chat_opened = False
+                                                st.session_state.food_chat_last_processed = ""
+                                        
+                                        st.session_state.food_chat_input = ""
+                                        st.rerun()
+                                    else:
+                                        try:
+                                            error_json = add_response.json()
+                                            st.error(f"Failed to add to cart: {error_json}")
+                                        except Exception:
+                                            st.error("Failed to add to cart")
+                                
+                                elif intent == "SKIP":
+                                    skip_msg = "No problem! Let me show you other options."
+                                    st.session_state.food_chat_history.append(
+                                        {"role": "assistant", "content": skip_msg}
+                                    )
+                                    
+                                    # Get next suggestion
+                                    next_response = requests.post(
+                                        f"{API_BASE_URL}/next-food-suggestion",
+                                        params={
+                                            "user_id": user_id,
+                                            "restaurant_id": food_item.get("restaurant_id"),
+                                            "lat": lat,
+                                            "lng": lng,
+                                            "chat_session_id": st.session_state.get("active_chat_session_id")
+                                        }
+                                    )
+                                    
+                                    if next_response.status_code == 200:
+                                        next_data = next_response.json()
+                                        if next_data.get("status") == "suggested":
+                                            next_food = next_data.get("food_item")
+                                            st.session_state.current_food_item = next_food
+                                            st.session_state.food_chat_opened = False
+                                            st.session_state.food_chat_last_processed = ""
+                                    
+                                    st.session_state.food_chat_input = ""
+                                    st.rerun()
+                        
+                        st.session_state.food_chat_input = ""
+                        st.rerun()
+                
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+
+            col_input, col_skip = st.columns([4, 1])
+            with col_input:
+                st.text_input(
+                    "Your response...",
+                    placeholder="e.g., Yes, I want it! or Tell me more about ingredients",
+                    key="food_chat_input"
+                )
+
+            with col_skip:
+                st.button("Skip ⏭️", use_container_width=True, on_click=_skip_food_chat)
+
+    else:
+        st.markdown("""
+            <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                        border-radius: 20px; padding: 30px; text-align: center; color: white; margin-bottom: 20px;">
+                <div style="font-size: 36px; font-weight: bold; margin-bottom: 10px;">🍽️ Food Chat</div>
+                <div style="font-size: 18px; line-height: 1.6;">
+                    Foods are shown automatically from your location. Click "💬 Chat AI" on any item to start the ordering conversation.
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("#### 🔍 Search or browse nearby food")
+        food_search = st.text_input(
+            "Search for a food item (optional)",
+            placeholder="Try burger, pizza, pasta, biryani...",
+            key="food_search"
+        )
+
+        browse_query = food_search.strip() if food_search else None
+
+        try:
+            with st.spinner("Loading food options..."):
+                browse_response = requests.get(
+                    f"{API_BASE_URL}/food-browse",
+                    params={
+                        "user_id": user_id,
+                        "query": browse_query,
+                        "lat": lat,
+                        "lng": lng,
+                        "limit": 8
+                    }
+                )
+
+            if browse_response.status_code == 200:
+                browse_data = browse_response.json()
+                food_items = browse_data.get("items", []) or []
+
+                if not food_items:
+                    fallback_terms = [browse_query] if browse_query else ["burger", "pizza", "pasta", "biryani", "noodle", "dessert"]
+                    fallback_terms = [term for term in fallback_terms if term]
+
+                    for term in fallback_terms:
+                        try:
+                            fallback_response = requests.get(
+                                f"{API_BASE_URL}/search-food",
+                                params={"food": term}
+                            )
+                            if fallback_response.status_code == 200:
+                                fallback_items = fallback_response.json() or []
+                                if isinstance(fallback_items, dict):
+                                    fallback_items = fallback_items.get("value") or fallback_items.get("items") or []
+                                for item in fallback_items:
+                                    if item not in food_items:
+                                        food_items.append(item)
+                        except Exception:
+                            continue
+
+                if food_items:
+                    heading = f"#### Found {len(food_items)} food options"
+                    if browse_query:
+                        heading = f"#### Results for '{browse_query}'"
+                    st.markdown(heading)
+
+                    for idx, food in enumerate(food_items):
+                        col1, col2, col3 = st.columns([2, 2, 1])
+
+                        with col1:
+                            st.markdown(f"**{food.get('food_name', 'Food item')}**")
+                            st.caption(f"₹{food.get('price', 'N/A')} • {food.get('category', 'Food')}")
+
+                        with col2:
+                            st.caption(f"🏪 {food.get('restaurant_name', 'Restaurant')}")
+
+                        with col3:
+                            if st.button("💬 Chat with AI", key=f"browse_chat_{idx}_{food.get('menu_id')}"):
+                                st.session_state.food_ai_chat_active = True
+                                st.session_state.current_food_item = food
+                                st.session_state.food_chat_history = []
+                                st.session_state.food_chat_opened = False
+                                st.session_state.food_chat_last_processed = ""
+                                st.rerun()
+                else:
+                    st.info("No food found nearby yet. Try a different search term or check your location.")
+            else:
+                st.error(f"Could not load food options: {browse_response.status_code}")
+        except Exception as e:
+            st.error(f"Error loading food options: {str(e)}")
 
 # ==================== CHAT TAB ====================
-with tab1:
-    st.subheader("Chat with Food AI Assistant")
+with tab2:
+    st.subheader("💬 Chat with AI Assistant")
     
     # Display chat history
     chat_container = st.container()
@@ -1134,7 +1539,6 @@ with tab1:
         except Exception as e:
             st.error(f"Error loading chat history: {str(e)}")
     
-# Display conversation with inline recommendations
     with chat_container:
         rendered_batch_ids = set()
 
@@ -1274,7 +1678,7 @@ with tab1:
         st.info(f"Selected command copied to input: {st.session_state.selected_option_text}")
 
 # ==================== PROFILE TAB ====================
-with tab2:
+with tab3:
     st.subheader("👤 User Profile")
     
     if st.button("Reload Profile"):
@@ -1335,7 +1739,7 @@ with tab2:
         st.info("Click 'Reload Profile' to see your profile details")
 
 # ==================== CART TAB ====================
-with tab3:
+with tab4:
     st.subheader("🛒 Shopping Cart")
 
     if st.button("Refresh Cart"):

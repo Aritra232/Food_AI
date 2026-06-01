@@ -1,11 +1,17 @@
 import re
 from datetime import datetime
 from uuid import uuid4
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Body
 from bson import ObjectId
+from pydantic import BaseModel
 
 # AI Services
-from service.ai import chat_with_ai, generate_embedding, detect_intent, extract_preferences
+from service.ai import (
+    chat_with_ai, generate_embedding, detect_intent, extract_preferences,
+    chat_about_food, detect_order_intent, extract_quantity, generate_opening_message,
+    generate_order_confirmation_message
+)
 
 # Memory Services
 from service.memory import (
@@ -47,6 +53,35 @@ from service.state import get_state, set_state
 app = FastAPI()
 
 
+class FoodChatRequest(BaseModel):
+    user_id: str
+    food_item: dict
+    user_message: Optional[str] = None
+    chat_session_id: Optional[str] = None
+
+
+class FoodIntentRequest(BaseModel):
+    user_id: str
+    user_response: str
+    food_item: dict
+    chat_session_id: Optional[str] = None
+
+
+class FoodOrderRequest(BaseModel):
+    user_id: str
+    food_item: dict
+    quantity: int = 1
+    chat_session_id: Optional[str] = None
+
+
+class FoodBrowseRequest(BaseModel):
+    user_id: str
+    query: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    limit: int = 8
+
+
 def _build_allergy_disclaimer(blocked_items, allergies):
     if not blocked_items:
         return ""
@@ -65,6 +100,39 @@ def _build_allergy_disclaimer(blocked_items, allergies):
         f"Safety note: I did not suggest {blocked_text} because they may contain "
         f"your allergy item(s)."
     )
+
+
+def _find_menu_item(food_item):
+    if not food_item:
+        return None
+
+    menu_item = None
+    if food_item.get("_id"):
+        try:
+            menu_item = menu_collection.find_one({"_id": ObjectId(food_item["_id"])})
+        except Exception:
+            menu_item = None
+
+    if not menu_item and food_item.get("menu_id"):
+        menu_item = menu_collection.find_one({"menu_id": food_item["menu_id"]})
+
+    if not menu_item and food_item.get("food_name"):
+        query = {
+            "food_name": food_item["food_name"],
+            "available": True
+        }
+        if food_item.get("restaurant_id"):
+            query["restaurant_id"] = food_item["restaurant_id"]
+        menu_item = menu_collection.find_one(query)
+
+    return menu_item
+
+
+def _build_order_confirmation(food_item, quantity):
+    food_name = food_item.get("food_name") or food_item.get("name") or food_item.get("title") or "this food"
+    restaurant_name = food_item.get("restaurant_name") or "the restaurant"
+    qty = max(1, int(quantity or 1))
+    return f"Awesome! I added {qty}x {food_name} from {restaurant_name} to your cart. Would you like a dessert or something else with it?"
 
 
 def _is_ingredient_question(message):
@@ -86,6 +154,43 @@ def _is_no_thanks_message(message):
 
 def _get_dessert_terms_regex():
     return r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|pudding|brownie|pastry|gelato|dessert|sweet"
+
+
+def _normalize_menu_item(item):
+    normalized = dict(item or {})
+    if normalized.get("_id") is not None:
+        normalized["_id"] = str(normalized["_id"])
+
+    if not normalized.get("food_name"):
+        normalized["food_name"] = normalized.get("name") or normalized.get("title") or normalized.get("category") or "Food item"
+
+    if normalized.get("restaurant_id") and not normalized.get("restaurant_name"):
+        rest_doc = restaurant_collection.find_one({"restaurant_id": normalized["restaurant_id"]})
+        if rest_doc:
+            normalized["restaurant_name"] = rest_doc.get("name") or rest_doc.get("restaurant_name") or "Restaurant"
+
+    return normalized
+
+
+def _merge_unique_menu_items(items, existing=None, limit=8):
+    merged = list(existing or [])
+    seen = set()
+    for item in merged:
+        key = str(item.get("menu_id") or item.get("_id") or item.get("food_name") or "").strip().lower()
+        if key:
+            seen.add(key)
+
+    for item in items or []:
+        normalized = _normalize_menu_item(item)
+        key = str(normalized.get("menu_id") or normalized.get("_id") or normalized.get("food_name") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        merged.append(normalized)
+        seen.add(key)
+        if len(merged) >= limit:
+            break
+
+    return merged[:limit]
 
 
 def _attach_restaurant_names(items):
@@ -1252,3 +1357,495 @@ def update_restaurant_request_status(request_id: str, status: str):
     updated = restaurant_requests_collection.find_one({"_id": object_id})
     updated["_id"] = str(updated["_id"])
     return updated
+
+
+# -------------------------
+# FOOD AI CHAT - New Feature
+# -------------------------
+
+@app.post("/food-ai-chat")
+def food_ai_chat(
+    request: Optional[FoodChatRequest] = Body(None),
+    user_id: str = None,
+    food_item: dict = None,
+    user_message: Optional[str] = None,
+    chat_session_id: Optional[str] = None
+):
+    """
+    Start or continue a conversation about a specific food item.
+    This integrates with the main chat history (not separate).
+    
+    Args:
+        user_id: User identifier
+        food_item: Dict with food details (food_name, price, category, ingredients, restaurant_name, etc.)
+        user_message: User's response (if None, generates opening message)
+        chat_session_id: Chat session ID to maintain history
+    
+    Returns:
+        AI response about the food and next action hint
+    """
+    if request is not None:
+        user_id = request.user_id or user_id
+        food_item = request.food_item or food_item or {}
+        user_message = request.user_message if request.user_message is not None else user_message
+        chat_session_id = request.chat_session_id or chat_session_id
+    else:
+        food_item = food_item or {}
+
+    profile = get_user_profile(user_id)
+    
+    if not user_message:
+        # Generate opening message
+        opening_msg = generate_opening_message(food_item)
+        add_message(user_id, "assistant", opening_msg, chat_session_id)
+        
+        return {
+            "status": "opened",
+            "message": opening_msg,
+            "food_item": food_item,
+            "next_action": "listen_to_user"
+        }
+
+    # Detect strong order intent before continuing conversation.
+    order_intent = detect_order_intent(user_message)
+    if order_intent.get("intent") == "ORDER":
+        quantity = extract_quantity(user_message)
+        menu_item = _find_menu_item(food_item)
+
+        if not menu_item:
+            raise HTTPException(status_code=404, detail="Food item not found in menu")
+
+        cart_item = {
+            "menu_id": menu_item["menu_id"],
+            "food_name": menu_item["food_name"],
+            "price": menu_item.get("price", 0),
+            "quantity": max(1, int(quantity)),
+            "restaurant_id": menu_item["restaurant_id"],
+            "from_food_chat": True
+        }
+
+        add_to_cart(user_id, cart_item)
+        record_order_history(user_id, cart_item)
+
+        # Prepare next suggestion for the AI confirmation message.
+        next_suggestion = get_next_food_suggestion(
+            user_id=user_id,
+            last_food_id=menu_item.get("menu_id"),
+            restaurant_id=menu_item.get("restaurant_id"),
+            lat=None,
+            lng=None,
+            chat_session_id=chat_session_id
+        )
+
+        next_food = None
+        if next_suggestion.get("status") == "suggested":
+            next_food = next_suggestion.get("food_item")
+
+        confirmation_msg = generate_order_confirmation_message(menu_item, quantity, next_food=next_food)
+        add_message(user_id, "user", user_message, chat_session_id)
+        add_message(user_id, "assistant", confirmation_msg, chat_session_id)
+
+        result = {
+            "status": "ordered",
+            "message": confirmation_msg,
+            "food_item": food_item,
+            "next_food": next_food,
+            "next_message": next_suggestion.get("message") if next_suggestion else None
+        }
+
+        if next_suggestion.get("status") == "suggested":
+            result["next_food"] = next_suggestion.get("food_item")
+            result["next_message"] = next_suggestion.get("message")
+
+        return result
+
+    # User responded, continue conversation
+    ai_result = chat_about_food(user_id, food_item, user_message, chat_session_id)
+    
+    return {
+        "status": "responded",
+        "message": ai_result["response"],
+        "food_item": food_item
+    }
+
+
+@app.post("/food-chat-intent")
+def analyze_food_chat_intent(
+    request: Optional[FoodIntentRequest] = Body(None),
+    user_id: str = None,
+    user_response: str = None,
+    food_item: dict = None,
+    chat_session_id: str = None
+):
+    """
+    Analyze user's intent in food chat conversation.
+    Detects: ORDER, SKIP, CLARIFY, or CONTINUE
+    
+    Args:
+        user_id: User identifier
+        user_response: User's text response
+        food_item: Current food being discussed
+        chat_session_id: Chat session ID
+    
+    Returns:
+        Intent detection result with action recommendation
+    """
+    if request is not None:
+        user_id = request.user_id or user_id
+        user_response = request.user_response or user_response
+        food_item = request.food_item or food_item or {}
+        chat_session_id = request.chat_session_id or chat_session_id
+    else:
+        food_item = food_item or {}
+
+    if not user_id or not user_response:
+        raise HTTPException(status_code=400, detail="Missing user_id or user_response")
+
+    intent_result = detect_order_intent(user_response)
+    intent = intent_result.get("intent")
+    quantity = extract_quantity(user_response)
+    
+    # Map intent to action
+    action = None
+    if intent == "ORDER":
+        action = "add_to_cart"
+    elif intent == "SKIP":
+        action = "show_next_food"
+    elif intent == "CLARIFY":
+        action = "continue_chat"
+    else:  # CONTINUE
+        action = "continue_chat"
+    
+    return {
+        "intent": intent,
+        "quantity": quantity,
+        "action": action,
+        "confidence": intent_result.get("confidence", 0.5)
+    }
+
+
+@app.post("/food-ai-order")
+def add_food_from_chat(
+    request: Optional[FoodOrderRequest] = Body(None),
+    user_id: str = None,
+    food_item: dict = None,
+    quantity: int = 1,
+    chat_session_id: Optional[str] = None
+):
+    """
+    Add a food item to cart from food AI chat.
+    
+    Args:
+        user_id: User identifier
+        food_item: Food being ordered (should have menu_id, food_name, price, restaurant_id)
+        quantity: How many to order
+        chat_session_id: Chat session ID
+    
+    Returns:
+        Success status, cart, and next suggestion
+    """
+    from bson import ObjectId
+
+    if request is not None:
+        user_id = request.user_id or user_id
+        food_item = request.food_item or food_item or {}
+        quantity = request.quantity if request.quantity is not None else quantity
+        chat_session_id = request.chat_session_id or chat_session_id
+    else:
+        food_item = food_item or {}
+
+    if not user_id or not food_item:
+        raise HTTPException(status_code=400, detail="Missing user_id or food_item")
+    
+    # Find menu item by menu_id or food_name
+    menu_item = None
+    if food_item.get("_id"):
+        try:
+            menu_item = menu_collection.find_one({"_id": ObjectId(food_item["_id"])})
+        except Exception:
+            pass
+    
+    if not menu_item and food_item.get("menu_id"):
+        menu_item = menu_collection.find_one({"menu_id": food_item["menu_id"]})
+
+    if not menu_item and food_item.get("food_name"):
+        query = {
+            "food_name": food_item["food_name"],
+            "available": True
+        }
+        if food_item.get("restaurant_id"):
+            query["restaurant_id"] = food_item["restaurant_id"]
+        menu_item = menu_collection.find_one(query)
+    
+    if not menu_item:
+        raise HTTPException(status_code=404, detail="Food item not found in menu")
+    
+    # Create cart item
+    cart_item = {
+        "menu_id": menu_item["menu_id"],
+        "food_name": menu_item["food_name"],
+        "price": menu_item["price"],
+        "quantity": max(1, int(quantity)),
+        "restaurant_id": menu_item["restaurant_id"],
+        "from_food_chat": True
+    }
+    
+    # Add to cart
+    add_to_cart(user_id, cart_item)
+    record_order_history(user_id, cart_item)
+    
+    # Get updated cart
+    cart = get_cart(user_id)
+    
+    # Save success message to history
+    success_msg = f"Great! I've added {quantity}x {menu_item['food_name']} to your cart! 🎉"
+    add_message(user_id, "user", f"Yes, I'll take it", chat_session_id)
+    add_message(user_id, "assistant", success_msg, chat_session_id)
+    
+    restaurant_id = menu_item.get("restaurant_id")
+    
+    return {
+        "status": "success",
+        "message": success_msg,
+        "cart": cart,
+        "restaurant_id": restaurant_id,
+        "next_action": "suggest_next_food"
+    }
+
+
+@app.get("/food-browse")
+def browse_food(user_id: str, query: str = None, lat: float = None, lng: float = None, limit: int = 8):
+    profile = get_user_profile(user_id)
+    preferences = profile.get("preferences", {})
+
+    items = []
+
+    def append_items(source_items):
+        nonlocal items
+        items = _merge_unique_menu_items(source_items, items, limit=limit)
+
+    if query:
+        try:
+            regex = re.compile(re.escape(query), re.IGNORECASE)
+            mongo_cursor = menu_collection.find({
+                "$or": [
+                    {"food_name": {"$regex": regex}},
+                    {"category": {"$regex": regex}},
+                    {"description": {"$regex": regex}},
+                    {"tags": {"$regex": regex}},
+                    {"ingredients": {"$regex": regex}},
+                ]
+            }).limit(limit)
+            append_items(list(mongo_cursor))
+        except Exception:
+            pass
+
+        try:
+            append_items(search_food(query))
+        except Exception:
+            pass
+
+        if len(items) < limit:
+            try:
+                append_items(semantic_food_search(query))
+            except Exception:
+                pass
+
+        if len(items) < limit and lat is not None and lng is not None:
+            try:
+                append_items(get_location_based_menus(lat, lng, query))
+            except Exception:
+                pass
+
+        if len(items) < limit:
+            try:
+                append_items(recommend_foods(user_id, query, lat=lat, lng=lng))
+            except Exception:
+                pass
+    else:
+        location_queries = ["popular", "food", "meal", "lunch", "dinner", "snack", "burger", "pizza", "pasta"]
+        if lat is not None and lng is not None:
+            for location_query in location_queries:
+                try:
+                    append_items(get_location_based_menus(lat, lng, location_query))
+                except Exception:
+                    continue
+                if len(items) >= limit:
+                    break
+
+        if len(items) < limit:
+            try:
+                append_items(recommend_foods(user_id, "popular food", lat=lat, lng=lng))
+            except Exception:
+                pass
+
+        if len(items) < limit:
+            try:
+                append_items(search_food("burger"))
+            except Exception:
+                pass
+
+    browsed_items = []
+    for item in items:
+        normalized = _normalize_menu_item(item)
+        normalized["dietary_safe"] = is_dietary_safe(normalized, preferences)
+        browsed_items.append(normalized)
+
+    return {
+        "status": "success",
+        "query": query,
+        "count": len(browsed_items),
+        "items": browsed_items[:limit]
+    }
+
+
+@app.post("/next-food-suggestion")
+def get_next_food_suggestion(
+    user_id: str, 
+    last_food_id: str = None, 
+    restaurant_id: str = None,
+    lat: float = None, 
+    lng: float = None,
+    chat_session_id: str = None
+):
+    """
+    Get next food suggestion after user orders a food via AI chat.
+    Strategy: First suggest other category foods (B), then desserts (A)
+    
+    Args:
+        user_id: User identifier
+        last_food_id: Menu ID of food just ordered
+        restaurant_id: Current restaurant ID
+        lat/lng: User location for nearby suggestions
+        chat_session_id: Chat session ID
+    
+    Returns:
+        Next food recommendation with AI suggestion message
+    """
+    profile = get_user_profile(user_id)
+    preferences = profile.get("preferences", {})
+    allergies = preferences.get("allergies", [])
+    
+    next_food = None
+    suggestion_type = None
+    
+    # First try: Get other category foods from same restaurant
+    if restaurant_id:
+        try:
+            cursor = menu_collection.find({
+                "restaurant_id": restaurant_id,
+                "available": True,
+                "menu_id": {"$ne": last_food_id}
+            }).limit(20)
+            
+            candidates = []
+            for item in cursor:
+                if not _looks_like_dessert_item(item) and is_dietary_safe(item, preferences):
+                    candidates.append(item)
+            
+            if candidates:
+                # Random selection for variety
+                import random
+                next_food = random.choice(candidates)
+                suggestion_type = "other_category"
+        except Exception:
+            pass
+    
+    # Fallback: Get dessert suggestions
+    if not next_food:
+        dessert_items = []
+        
+        if lat is not None and lng is not None:
+            # Location-based desserts
+            for query in ["dessert", "sweet", "cake", "ice cream"]:
+                items = get_location_based_menus(lat, lng, query)
+                for item in items:
+                    if is_dietary_safe(item, preferences):
+                        dessert_items.append(item)
+                if len(dessert_items) >= 5:
+                    break
+        elif restaurant_id:
+            # Restaurant-specific desserts
+            cursor = menu_collection.find({
+                "restaurant_id": restaurant_id,
+                "available": True,
+                "$or": [
+                    {"category": {"$regex": "dessert", "$options": "i"}},
+                    {"food_name": {"$regex": _get_dessert_terms_regex(), "$options": "i"}}
+                ]
+            }).limit(10)
+            
+            for item in cursor:
+                if is_dietary_safe(item, preferences):
+                    dessert_items.append(item)
+        
+        if dessert_items:
+            import random
+            next_food = random.choice(dessert_items)
+            suggestion_type = "dessert"
+    
+    # If still no food, use AI recommendations
+    if not next_food:
+        recommendations = recommend_foods(user_id, "dessert")
+        if recommendations:
+            next_food = recommendations[0]
+            suggestion_type = "ai_dessert"
+    
+    if not next_food:
+        return {
+            "status": "no_suggestion",
+            "message": "No more suggestions available right now."
+        }
+    
+    # Ensure ObjectId is stringified
+    if "_id" in next_food and isinstance(next_food["_id"], ObjectId):
+        next_food["_id"] = str(next_food["_id"])
+    
+    # Get restaurant name if available
+    if next_food.get("restaurant_id") and not next_food.get("restaurant_name"):
+        rest_doc = restaurant_collection.find_one({"restaurant_id": next_food["restaurant_id"]})
+        if rest_doc:
+            next_food["restaurant_name"] = rest_doc.get("name") or rest_doc.get("restaurant_name", "Restaurant")
+    
+    # Generate suggestion message
+    if suggestion_type == "other_category":
+        suggestion_msg = f"How about also trying {next_food.get('food_name')}? It's from a different category and looks delicious!"
+    elif suggestion_type in ["dessert", "ai_dessert"]:
+        suggestion_msg = f"Would you like to add a dessert? I recommend: {next_food.get('food_name')} for ${next_food.get('price')}!"
+    else:
+        suggestion_msg = f"Next, how about: {next_food.get('food_name')} from {next_food.get('restaurant_name', 'this restaurant')}?"
+    
+    add_message(user_id, "assistant", suggestion_msg, chat_session_id)
+    
+    return {
+        "status": "suggested",
+        "type": suggestion_type,
+        "message": suggestion_msg,
+        "food_item": next_food,
+        "next_action": "listen_to_user"
+    }
+
+
+@app.get("/food-chat-history")
+def get_food_chat_history(user_id: str, chat_session_id: str = None):
+    """
+    Get food chat history (integrated with main chat history).
+    Returns all messages containing food chat interactions.
+    """
+    conversation = get_conversation(user_id, chat_session_id)
+    
+    # Filter messages that are part of food chat
+    food_chat_messages = []
+    for msg in conversation:
+        content = msg.get("content", "").lower()
+        # Heuristic: food chat messages mention specific foods, prices, or ordering
+        if any(word in content for word in ["chat with ai", "order", "add to cart", "price", "ingredient", "dessert"]):
+            food_chat_messages.append(msg)
+    
+    return {
+        "user_id": user_id,
+        "chat_session_id": chat_session_id,
+        "total_messages": len(conversation),
+        "food_chat_messages": food_chat_messages
+    }
+

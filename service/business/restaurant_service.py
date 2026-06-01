@@ -71,13 +71,20 @@ def add_menu_item(data):
 # KEYWORD SEARCH
 # -------------------------
 def search_food(food_name):
+    regex = {
+        "$regex": food_name,
+        "$options": "i"
+    }
 
     return list(menu_collection.find({
-        "food_name": {
-            "$regex": food_name,
-            "$options": "i"
-        },
-        "available": True
+        "available": True,
+        "$or": [
+            {"food_name": regex},
+            {"category": regex},
+            {"description": regex},
+            {"tags": regex},
+            {"ingredients": regex}
+        ]
     }))
 
 
@@ -87,22 +94,35 @@ def search_food(food_name):
 def semantic_food_search(query):
 
     query_embedding = generate_embedding(query)
-
     res = query_vector(query_embedding, top_k=5, filter=None)
 
-    matches = []
+    candidate_list = []
     try:
         candidate_list = res.matches if hasattr(res, 'matches') else res.get('matches', [])
     except Exception:
-        candidate_list = res.get('matches', []) if isinstance(res, dict) else []
+        if isinstance(res, dict):
+            candidate_list = res.get('matches', [])
 
+    menu_items = []
+    seen = set()
     for m in candidate_list:
         mid = m.id if hasattr(m, 'id') else m.get('id')
         score = getattr(m, 'score', m.get('score'))
-        meta = m.metadata if hasattr(m, 'metadata') else m.get('metadata', {})
-        matches.append({"id": mid, "score": score, "metadata": meta})
+        if not mid or mid in seen:
+            continue
 
-    return {"matches": matches}
+        menu_item = menu_collection.find_one({
+            "menu_id": mid,
+            "available": True
+        })
+
+        if menu_item:
+            menu_item["_id"] = str(menu_item["_id"])
+            menu_item["semantic_score"] = score
+            menu_items.append(menu_item)
+            seen.add(mid)
+
+    return menu_items
 
 
 # -------------------------
@@ -123,19 +143,10 @@ def hybrid_food_search(query):
         seen.add(item["menu_id"])
 
     # semantic
-    for match in semantic_results["matches"]:
-
-        if match["id"] in seen:
+    for menu_item in semantic_results:
+        if menu_item["menu_id"] in seen:
             continue
-
-        menu_item = menu_collection.find_one({
-            "menu_id": match["id"]
-        })
-
-        if menu_item:
-            menu_item["_id"] = str(menu_item["_id"])
-            menu_item["semantic_score"] = match["score"]
-            combined.append(menu_item)
+        combined.append(menu_item)
 
     return combined
 

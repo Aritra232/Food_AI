@@ -1,4 +1,4 @@
-from openai import OpenAI
+from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 import json
@@ -12,8 +12,8 @@ from service.business.location_service import get_nearby_restaurants
 
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
+client = Anthropic(
+    api_key=os.getenv("CLAUDE_API_KEY")
 )
 
 _DIETARY_QUERY_TERMS = {
@@ -195,32 +195,33 @@ def _expand_search_queries_with_ai(food_query, preferences):
     dietary_restrictions = (preferences or {}).get("dietary_restrictions", []) or []
     preferred_cuisines = (preferences or {}).get("preferred_cuisines", []) or []
 
-    prompt = f"""
-    Generate 5 short food search queries that can match real restaurant menu items.
+    system_prompt = """You generate short, specific food search queries that will match real restaurant menu items.
 
-    Return ONLY valid JSON as an array of strings.
+Important:
+- Return ONLY valid JSON as an array of strings
+- No explanations, numbering, or markdown
+- Each query should be 1-4 words
+- Do not repeat the same phrase"""
 
-    User request: {food_query}
-    Dietary style: {dietary_style or 'none'}
-    Dietary restrictions: {', '.join(dietary_restrictions) or 'none'}
-    Preferred cuisines: {', '.join(preferred_cuisines) or 'none'}
+    prompt = f"""Generate 5 short food search queries that match real restaurant menu items.
 
-    Rules:
-    - Prefer broad menu terms that restaurants actually use.
-    - If the user request is mainly dietary, translate it into dish categories instead of repeating the diet label.
-    - Keep each query short, natural, and searchable.
-    - Do not include explanations, numbering, or markdown.
-    - Do not repeat the exact same phrase more than once.
-    """
+User request: {food_query}
+Dietary style: {dietary_style or 'none'}
+Dietary restrictions: {', '.join(dietary_restrictions) or 'none'}
+Preferred cuisines: {', '.join(preferred_cuisines) or 'none'}
+
+Rules:
+- Prefer broad menu terms that restaurants actually use
+- If the user request is mainly dietary, translate it into dish categories instead of repeating the diet label
+- Keep each query short, natural, and searchable
+- Return ONLY JSON array of strings, no explanation"""
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+        response = client.messages.create(
+            model=os.getenv("CLAUDE_MODEL", "claude-opus-4-6"),
+            max_tokens=256,
+            system=system_prompt,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You generate short food search queries for a restaurant recommender."
-                },
                 {
                     "role": "user",
                     "content": prompt
@@ -229,7 +230,7 @@ def _expand_search_queries_with_ai(food_query, preferences):
             temperature=0.2
         )
 
-        content = response.choices[0].message.content or ""
+        content = response.content[0].text or ""
         parsed = json.loads(content)
 
         if isinstance(parsed, str):

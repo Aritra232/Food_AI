@@ -7,6 +7,12 @@ def detect_intent(message: str):
     if stripped.upper() in {"A", "B", "C", "D", "E"}:
         return "select"
 
+    # modification intent should take precedence when the user mentions removal or changes
+    if any(word in lower_message for word in [
+        "remove", "change", "add more", "extra"
+    ]):
+        return "modify"
+
     # ordering intent
     if any(word in lower_message for word in [
         "want", "crave", "hungry", "order", "eat"
@@ -25,11 +31,5 @@ def detect_intent(message: str):
         "cart", "checkout", "confirm", "place order", "yes", "confirm order"
     ]):
         return "checkout"
-
-    # modification intent
-    if any(word in lower_message for word in [
-        "remove", "change", "add more", "extra"
-    ]):
-        return "modify"
 
     return "chat"

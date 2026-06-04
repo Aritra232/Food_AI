@@ -35,6 +35,7 @@ from service.recommendation import (
 from service.business import (
     add_restaurant, add_menu_item, search_food, semantic_food_search, get_location_based_menus,
     add_to_cart, get_cart, update_item_instruction,
+    remove_one_item,
     add_item, remove_item, get_or_create_cart, calculate_total
 )
 
@@ -82,6 +83,23 @@ def _is_no_thanks_message(message):
         "don't want", "do not want", "dont want", "not this",
         "never mind", "nah", "nope", "not that"
     }
+
+
+def _extract_remove_item_name(message):
+    text = (message or "").strip().lower()
+    if not text:
+        return None
+
+    match = re.search(
+        r"(?:remove|delete|take\s+out)\s+(?:one\s+|the\s+|a\s+|an\s+)?(.+?)(?:\s+from\s+my\s+cart|\s+from\s+my\s+order|\s+from\s+the\s+cart|\s+from\s+cart|\s+from\s+it|\.|$)",
+        text
+    )
+    if match:
+        item_name = match.group(1).strip()
+        item_name = re.sub(r"\s+(please|now|today)$", "", item_name).strip()
+        return item_name or None
+
+    return None
 
 
 def _get_dessert_terms_regex():
@@ -702,7 +720,77 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
         }
 
 
-    
+    # -------------------------
+    # CASE 1.5: CART MODIFICATION
+    if intent == "modify":
+        remove_description = _extract_remove_item_name(message)
+        cart = get_cart(user_id) or {"items": []}
+        removed_cart = None
+
+        if remove_description:
+            removed_cart = remove_one_item(user_id, food_name=remove_description)
+
+        if not removed_cart and remove_description is None and cart.get("items"):
+            # If user only asked to remove one and no item name was provided,
+            # infer the most likely item from cart state.
+            candidate_item = None
+            items = cart.get("items", [])
+
+            # Prefer a single distinct item
+            if len(items) == 1:
+                candidate_item = items[0]
+            else:
+                # First prefer an item with quantity > 1
+                for item in items:
+                    if int(item.get("quantity", 1) or 1) > 1:
+                        candidate_item = item
+                        break
+
+                # Next prefer a duplicated menu_id entry when there are repeated items
+                if candidate_item is None:
+                    counts = {}
+                    for item in items:
+                        mid = item.get("menu_id") or item.get("food_name")
+                        if not mid:
+                            continue
+                        counts[mid] = counts.get(mid, 0) + 1
+
+                    for item in items:
+                        mid = item.get("menu_id") or item.get("food_name")
+                        if mid and counts.get(mid, 0) > 1:
+                            candidate_item = item
+                            break
+
+            if candidate_item is not None:
+                removed_cart = remove_one_item(
+                    user_id,
+                    menu_id=candidate_item.get("menu_id"),
+                    food_name=candidate_item.get("food_name")
+                )
+                remove_description = candidate_item.get("food_name") or candidate_item.get("menu_id")
+
+        if removed_cart:
+            response = f"Removed one {remove_description} from your cart."
+            add_message(user_id, "user", message, chat_session_id)
+            add_message(user_id, "assistant", response, chat_session_id)
+            set_state(user_id, "cart")
+            return {
+                "intent": intent,
+                "state": "cart",
+                "message": response,
+                "cart": removed_cart
+            }
+
+        error_msg = "I could not find that item in your cart to remove. Please tell me the exact item name."
+        add_message(user_id, "assistant", error_msg, chat_session_id)
+        set_state(user_id, "cart")
+        return {
+            "intent": intent,
+            "state": "cart",
+            "message": error_msg,
+            "cart": cart
+        }
+
 
     # Save user message to conversation history for order/select/checkout flow
     add_message(user_id, "user", message, chat_session_id)

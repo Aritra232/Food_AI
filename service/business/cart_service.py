@@ -51,6 +51,55 @@ def add_to_cart(user_id, item):
     )
 
 
+def remove_one_item(user_id, menu_id=None, food_name=None):
+    """Remove one matching item from the user's cart.
+
+    If the item has quantity > 1, decrement by one.
+    Otherwise remove the cart entry entirely.
+    """
+    cart = cart_collection.find_one({"user_id": user_id})
+    if not cart or not cart.get("items"):
+        return None
+
+    items = list(cart["items"])
+    target_index = None
+
+    if menu_id:
+        normalized_menu_id = str(menu_id or "").strip()
+        for idx, item in enumerate(items):
+            item_menu_id = str(item.get("menu_id", "") or "").strip()
+            if item_menu_id == normalized_menu_id:
+                target_index = idx
+                break
+    elif food_name:
+        normalized = str(food_name or "").strip().lower()
+        if normalized:
+            for idx, item in enumerate(items):
+                item_name = str(item.get("food_name", "")).strip().lower()
+                if item_name == normalized or normalized in item_name or item_name in normalized:
+                    target_index = idx
+                    break
+
+    if target_index is None:
+        return None
+
+    target_item = items[target_index]
+    quantity = int(target_item.get("quantity", 1) or 1)
+
+    if quantity > 1:
+        items[target_index]["quantity"] = quantity - 1
+    else:
+        items.pop(target_index)
+
+    cart_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"items": items}}
+    )
+
+    updated_cart = cart_collection.find_one({"user_id": user_id})
+    return _serialize_mongo_value(updated_cart)
+
+
 def get_cart(user_id):
 
     cart = cart_collection.find_one(

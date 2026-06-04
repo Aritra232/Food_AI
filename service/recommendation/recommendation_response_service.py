@@ -1,4 +1,4 @@
-from openai import OpenAI
+from anthropic import Anthropic
 from dotenv import load_dotenv
 
 import os
@@ -7,8 +7,8 @@ from service.data.database_service import restaurant_collection
 
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
+client = Anthropic(
+    api_key=os.getenv("CLAUDE_API_KEY")
 )
 
 
@@ -85,7 +85,10 @@ def generate_recommendation_response(
     recommendations,
     user_preferences=None
 ):
-
+    """
+    Generate recommendation response using Claude for superior natural language.
+    Claude produces more engaging, contextually-aware recommendations.
+    """
     recommendations = recommendations or []
 
     if not recommendations:
@@ -103,52 +106,43 @@ def generate_recommendation_response(
     dietary_restrictions = user_preferences.get("dietary_restrictions", []) if isinstance(user_preferences, dict) else []
     allergies = user_preferences.get("allergies", []) if isinstance(user_preferences, dict) else []
 
-    prompt = f"""
-    CRAFT Prompt
+    system_prompt = """You are a friendly, knowledgeable AI food recommendation assistant. Your recommendations are helpful, personalized, and safe.
 
-    C - Context:
-    The user said: {user_message}
-    User preferences:
-    - Dietary style: {dietary_style or 'none'}
-    - Dietary restrictions: {', '.join(dietary_restrictions) or 'none'}
-    - Allergies: {', '.join(allergies) or 'none'}
+Guidelines:
+- Always mention every available option
+- For each option, include the food name, restaurant, and a brief reason why it fits the user
+- Never invent menu items, prices, or restaurants
+- If the user has allergies or dietary restrictions, reassure them that these options are safe
+- Be warm, conversational, and decision-helpful
+- Keep it concise (2-3 sentences per option max)
+- Focus on why each option is good for THIS user specifically"""
 
-    Recommended foods:
-    {formatted_foods}
+    prompt = f"""The user said: "{user_message}"
 
-    R - Role:
-    You are a careful AI food assistant that recommends only the items provided.
+Their preferences:
+- Dietary style: {dietary_style or 'None specified'}
+- Dietary restrictions: {', '.join(dietary_restrictions) if dietary_restrictions else 'None'}
+- Allergies: {', '.join(allergies) if allergies else 'None'}
 
-    A - Audience:
-    Write for a user who wants a simple, friendly, decision-ready food recommendation.
+Available options:
+{formatted_foods}
 
-    F - Format:
-    - Use the option labels exactly as provided: {option_labels}
-    - Mention every available option in the list; do not omit later options
-    - For each option, include the food name, restaurant name, and one short reason it fits
-    - Do not invent new menu items, prices, or restaurants
-    - Do not mention internal scores or backend details
+Create a friendly recommendation response. Mention {option_labels}. Explain why each option fits their needs. Be personal but concise."""
 
-    T - Tone:
-    Be concise, natural, confident, and helpful.
-    If the user's diet or allergies matter, briefly explain why the options are safe or suitable.
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+    response = client.messages.create(
+        model=os.getenv("CLAUDE_MODEL", "claude-opus-4-6"),
+        max_tokens=1024,
+        system=system_prompt,
         messages=[
-            {
-                "role": "system",
-                "content": "You are an intelligent AI food assistant that follows CRAFT instructions exactly."
-            },
             {
                 "role": "user",
                 "content": prompt
             }
-        ]
+        ],
+        temperature=0.7
     )
 
     return {
-        "response": response.choices[0].message.content,
+        "response": response.content[0].text,
         "options": options
     }

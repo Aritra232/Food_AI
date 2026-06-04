@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 openai
+anthropic
 pymongo
 python-dotenv
 pinecone

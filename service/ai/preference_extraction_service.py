@@ -1,4 +1,4 @@
-from openai import OpenAI
+from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 import json
@@ -6,13 +6,16 @@ import re
 
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
+client = Anthropic(
+    api_key=os.getenv("CLAUDE_API_KEY")
 )
 
 
 def extract_preferences(user_message, conversation_history=None, existing_allergies=None):
-
+    """
+    Extract food preferences using Claude.
+    Claude is better at understanding context, nuance, and resolving ambiguity.
+    """
     return extract_preferences_with_context(
         user_message,
         conversation_history=conversation_history,
@@ -215,61 +218,119 @@ def _sanitize_extracted_preferences(user_message, extracted):
     return extracted
 
 
-def extract_preferences_with_context(user_message, conversation_history=None, existing_allergies=None):
+def _extract_json_object(text):
+    if not text:
+        return None
 
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    candidate = text[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
+def _extract_allergies_from_text(text):
+    if not text:
+        return []
+
+    text = str(text).strip()
+    patterns = [
+        r"(?:allerg(?:y|ic) to|intolerant to|intolerance to|reaction to|can(?:'t| not) eat|cannot eat)\s+([a-z0-9 ,&\-]+)",
+    ]
+    allergies = []
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                match = match[-1]
+            for item in re.split(r",| and | & |/|;|\\band\\b", match, flags=re.IGNORECASE):
+                cleaned = re.sub(r"[^a-zA-Z0-9\- ]", "", item or "").strip()
+                if cleaned:
+                    allergies.append(cleaned)
+
+    deduped = []
+    seen = set()
+    for item in allergies:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+
+    return deduped
+
+
+def extract_preferences_with_context(user_message, conversation_history=None, existing_allergies=None):
+    """
+    Extract preferences using Claude for superior context understanding.
+    """
     normalized_user_message = _expand_user_shorthand(user_message)
     context_block = _build_context_block(conversation_history)
     allergies_hint = ", ".join(existing_allergies or [])
 
-    prompt = f"""
-    Extract food preferences from the user message.
+    system_prompt = """You are an expert food preference extraction AI. Your job is to carefully analyze user messages and extract structured food preferences.
 
-    Return ONLY valid JSON.
+Return ONLY valid JSON. Be precise and careful about allergies vs dislikes.
 
-    Example format:
+Key rules:
+- Allergies are health/safety concerns (user says: allergic, intolerant, reaction)
+- Disliked foods are taste preferences (user says: don't like, hate, not a fan)
+- Never put allergy items in "disliked_foods"
+- For dietary preferences (vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, low-carb), normalize to the exact term
+- If user says "both", "all of them", "these", resolve to exact items from context
+- Avoid vague terms like "both" as allergy items
+"""
 
-    {{
-        "favorite_foods": [],
-        "disliked_foods": [],
-        "allergies": [],
-        "dietary_style": "",
-        "dietary_restrictions": [],
-        "spicy_level": "",
-        "budget_range": "",
-        "preferred_cuisines": [],
-        "favorite_restaurants": [],
-        "favorite_drinks": [],
-        "delivery_speed_preference": "",   # express|standard|slow
-        "preferred_meal_time": []
-    }}
+    prompt = f"""Extract food preferences from this user message.
 
-    Rules:
-    - If the user says they are allergic to something, put it in "allergies".
-    - Do NOT place allergy items in "disliked_foods".
-    - Use "disliked_foods" only for foods the user does not like.
-    - If the user mentions a diet such as vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, or low-carb, fill both "dietary_style" and "dietary_restrictions" with the best matching normalized label.
-    - If the user describes a custom diet in their own words, normalize it to the closest useful menu label rather than copying the exact wording verbatim.
-    - If the user says "both", "all of them", "these", "those", "them", or similar, resolve it to the exact allergy items from the recent conversation context.
-    - Never store vague words like "both" as an allergy item.
-    - Users may type short forms (example: fvrt=favorite, algy=allergy, bgt=budget, spcy=spicy, addr=address). Interpret these correctly.
+Recent conversation context:
+{context_block or "None"}
 
-    Recent Conversation Context:
-    {context_block or "None"}
+Existing known allergies:
+{allergies_hint or "None"}
 
-    Existing Known Allergies:
-    {allergies_hint or "None"}
+User message:
+{normalized_user_message}
 
-    User Message:
-    {normalized_user_message}
-    """
+Return JSON in this format (ONLY JSON, no explanation):
+{{
+    "favorite_foods": [],
+    "disliked_foods": [],
+    "allergies": [],
+    "dietary_style": "",
+    "dietary_restrictions": [],
+    "spicy_level": "",
+    "budget_range": "",
+    "preferred_cuisines": [],
+    "favorite_restaurants": [],
+    "favorite_drinks": [],
+    "delivery_speed_preference": "",
+    "preferred_meal_time": []
+}}
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+Rules:
+- If the user says they are allergic to something, put it in "allergies".
+- Do NOT place allergy items in "disliked_foods".
+- Use "disliked_foods" only for foods the user does not like.
+- If the user mentions a diet such as vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, or low-carb, fill both "dietary_style" and "dietary_restrictions" with the best matching normalized label.
+- If the user says "both", "all of them", "these", "those", "them", or similar, resolve it to the exact allergy items from the recent conversation context.
+- Never store vague words like "both" as an allergy item.
+"""
+
+    response = client.messages.create(
+        model=os.getenv("CLAUDE_MODEL", "claude-opus-4-6"),
+        max_tokens=1024,
+        system=system_prompt,
         messages=[
-            {
-                "role": "system",
-                "content": "You extract food preferences."
-            },
             {
                 "role": "user",
                 "content": prompt
@@ -278,39 +339,59 @@ def extract_preferences_with_context(user_message, conversation_history=None, ex
         temperature=0
     )
 
-    content = response.choices[0].message.content
+    content = response.content[0].text
 
+    extracted = None
     try:
         extracted = json.loads(content)
+    except Exception:
+        extracted = _extract_json_object(content)
 
-        if existing_allergies:
-            normalized_existing = [str(item).strip() for item in existing_allergies if str(item).strip()]
-
-            allergy_values = extracted.get("allergies", [])
-            if isinstance(allergy_values, str):
-                allergy_values = [allergy_values]
-
-            cleaned_allergies = []
-            generic_terms = {"both", "all", "all of them", "these", "those", "them", "it", "ones", "them all"}
-
-            for item in allergy_values:
-                cleaned = str(item).strip()
-                if not cleaned:
-                    continue
-                if cleaned.lower() in generic_terms:
-                    cleaned_allergies.extend(normalized_existing)
-                    continue
-                cleaned_allergies.append(cleaned)
-
-            if cleaned_allergies:
-                deduped = []
-                for item in cleaned_allergies:
-                    if item not in deduped:
-                        deduped.append(item)
-                extracted["allergies"] = deduped
-
-        extracted = _sanitize_extracted_preferences(normalized_user_message, extracted)
-
-        return extracted
-    except:
+    if not isinstance(extracted, dict):
+        fallback_allergies = _extract_allergies_from_text(normalized_user_message)
+        if fallback_allergies:
+            return _sanitize_extracted_preferences(normalized_user_message, {
+                "favorite_foods": [],
+                "disliked_foods": [],
+                "allergies": fallback_allergies,
+                "dietary_style": "",
+                "dietary_restrictions": [],
+                "spicy_level": "",
+                "budget_range": "",
+                "preferred_cuisines": [],
+                "favorite_restaurants": [],
+                "favorite_drinks": [],
+                "delivery_speed_preference": "",
+                "preferred_meal_time": []
+            })
         return {}
+
+    if existing_allergies:
+        normalized_existing = [str(item).strip() for item in existing_allergies if str(item).strip()]
+
+        allergy_values = extracted.get("allergies", [])
+        if isinstance(allergy_values, str):
+            allergy_values = [allergy_values]
+
+        cleaned_allergies = []
+        generic_terms = {"both", "all", "all of them", "these", "those", "them", "it", "ones", "them all"}
+
+        for item in allergy_values:
+            cleaned = str(item).strip()
+            if not cleaned:
+                continue
+            if cleaned.lower() in generic_terms:
+                cleaned_allergies.extend(normalized_existing)
+                continue
+            cleaned_allergies.append(cleaned)
+
+        if cleaned_allergies:
+            deduped = []
+            for item in cleaned_allergies:
+                if item not in deduped:
+                    deduped.append(item)
+            extracted["allergies"] = deduped
+
+    extracted = _sanitize_extracted_preferences(normalized_user_message, extracted)
+
+    return extracted

@@ -123,6 +123,10 @@ if "awaiting_order_summary_prompt" not in st.session_state:
     st.session_state.awaiting_order_summary_prompt = False
 if "restaurant_request_created" not in st.session_state:
     st.session_state.restaurant_request_created = None
+if "show_food_items_panel" not in st.session_state:
+    st.session_state.show_food_items_panel = False
+if "food_items" not in st.session_state:
+    st.session_state.food_items = []
 
 # Sidebar - User Settings
 st.sidebar.title("👤 User Settings")
@@ -399,8 +403,13 @@ def _render_onboarding_success():
     col_primary, col_secondary = st.columns(2)
     with col_primary:
         if st.button("Start Ordering with AI", use_container_width=True):
-            st.session_state.onboarding_show_success = False
-            st.rerun()
+            result, error = _start_order_with_ai()
+            if error:
+                st.error(error)
+            elif result:
+                st.session_state.onboarding_show_success = False
+                st.success("AI order session started. You can continue in the chat tab.")
+                st.rerun()
     with col_secondary:
         if st.button("Explore App", use_container_width=True):
             st.session_state.onboarding_show_success = False
@@ -649,6 +658,51 @@ def _load_cart_summary():
     if response.status_code != 200:
         raise RuntimeError(f"Failed to load cart: {response.status_code} {response.text}")
     return response.json()
+
+
+def _load_food_items(limit: int = 12):
+    response = requests.get(f"{API_BASE_URL}/food-items", params={"limit": limit})
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to load food items: {response.status_code} {response.text}")
+    return response.json()
+
+
+def _add_food_item_to_cart(item, quantity: int = 1):
+    payload = {
+        "menu_id": item.get("menu_id"),
+        "quantity": quantity
+    }
+    response = requests.post(f"{API_BASE_URL}/cart/add-item", json=payload, params={"user_id": user_id})
+    if response.status_code != 200:
+        return None, f"Failed to add item to cart: {response.status_code} {response.text}"
+    return response.json(), None
+
+
+def _order_item_with_ai(item):
+    """Show only the selected item for confirmation in recommendations panel."""
+    batch_id = uuid4().hex
+    
+    # Attach restaurant name if available
+    if "restaurant_name" not in item and item.get("restaurant_id"):
+        response = requests.get(f"{API_BASE_URL}/restaurant/{item.get('restaurant_id')}")
+        if response.status_code == 200:
+            restaurant = response.json()
+            item["restaurant_name"] = restaurant.get("name", item.get("restaurant_id"))
+    
+    # Create a single-item recommendation batch
+    batch_entry = {
+        "batch_id": batch_id,
+        "assistant_text": f"Here's your selected item: {item.get('food_name')}",
+        "recommendations": [item]
+    }
+    
+    # Add to recommendation history
+    st.session_state.recommendation_history = st.session_state.recommendation_history + [batch_entry]
+    st.session_state.current_recommendations = [item]
+    st.session_state.active_recommendation_batch_id = batch_id
+    st.session_state.option_quantities[f"{batch_id}_A"] = 1
+    
+    return {"success": True}, None
 
 
 def _create_restaurant_request():
@@ -1021,6 +1075,52 @@ def _send_chat_message(message_text, recommendation_batch_id=None):
     return result, None
 
 
+def _start_order_with_ai():
+    response = requests.post(
+        f"{API_BASE_URL}/order-with-ai",
+        params={
+            "user_id": user_id,
+            "lat": lat,
+            "lng": lng,
+            "chat_session_id": st.session_state.get("active_chat_session_id")
+        }
+    )
+
+    if response.status_code != 200:
+        return None, f"Error: {response.status_code}\n{response.text}"
+
+    result = response.json()
+    assistant_text = _extract_assistant_text(result)
+
+    if assistant_text:
+        st.session_state.last_assistant_response = assistant_text
+        st.session_state.chat_history = st.session_state.chat_history + [{"role": "assistant", "content": assistant_text}]
+
+    recommendations = result.get("recommendations") or []
+    show_instruction_card = bool(result.get("show_instruction_card"))
+
+    if show_instruction_card:
+        st.session_state.awaiting_instruction_prompt = True
+        st.session_state.instruction_input_open = False
+        st.session_state.pending_instruction_restaurant_id = result.get("restaurant_id")
+
+    if recommendations:
+        try:
+            _append_recommendation_batch(result, assistant_text)
+        except Exception:
+            batch_id = result.get("recommendation_batch_id") or uuid4().hex
+            batch_entry = {
+                "batch_id": batch_id,
+                "assistant_text": assistant_text or "",
+                "recommendations": recommendations[:5]
+            }
+            st.session_state.recommendation_history = st.session_state.recommendation_history + [batch_entry]
+            st.session_state.current_recommendations = recommendations[:5]
+            st.session_state.active_recommendation_batch_id = batch_id
+
+    return result, None
+
+
 def _render_recommendations():
     recommendation_batches = st.session_state.recommendation_history
 
@@ -1086,6 +1186,18 @@ def _render_recommendations():
 
 # Main title
 st.title("🍔 Food AI Chatbot")
+
+col_action, col_food, col_cart = st.columns([6, 1, 1])
+with col_food:
+    if st.button("Food items", use_container_width=True):
+        st.session_state.food_items = _load_food_items()
+        st.session_state.show_food_items_panel = True
+        st.rerun()
+with col_cart:
+    if st.button("View cart", use_container_width=True):
+        st.session_state.show_food_items_panel = False
+        st.rerun()
+
 st.markdown("---")
 
 if st.session_state.get("restaurant_request_created"):
@@ -1135,6 +1247,49 @@ with tab1:
             st.error(f"Error loading chat history: {str(e)}")
     
 # Display conversation with inline recommendations
+    if st.session_state.get("show_food_items_panel"):
+        st.subheader("🍽️ Food items from restaurants")
+
+        if not st.session_state.food_items:
+            st.info("No food items loaded yet. Click the button above to load food items.")
+        else:
+            cols = st.columns(3)
+            for idx, item in enumerate(st.session_state.food_items):
+                col = cols[idx % 3]
+                with col:
+                    title = item.get("food_name", "Unknown item")
+                    restaurant = item.get("restaurant_name", item.get("restaurant_id", "Unknown restaurant"))
+                    price = item.get("price", "N/A")
+                    category = item.get("category", "")
+                    description = item.get("description", "")
+
+                    st.markdown(
+                        f"""
+                        <div style='background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;box-shadow:0 6px 16px rgba(0,0,0,0.06);margin-bottom:16px;'>
+                            <div style='font-weight:700;font-size:16px;margin-bottom:6px;'>{title}</div>
+                            <div style='color:#4b5563;font-size:14px;margin-bottom:6px;'>Restaurant: {restaurant}</div>
+                            <div style='color:#6b7280;font-size:13px;margin-bottom:8px;'>Category: {category}</div>
+                            <div style='color:#111827;font-size:15px;margin-bottom:10px;'>Price: ₹{price}</div>
+                            <div style='color:#6b7280;font-size:13px;margin-bottom:12px;'>{description}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                    if st.button("Order with AI", key=f"order_ai_{item.get('menu_id')}", use_container_width=True):
+                        try:
+                            result, error = _order_item_with_ai(item)
+                            if error:
+                                st.error(error)
+                            elif result:
+                                st.success("Order request sent to AI.")
+                                st.session_state.show_food_items_panel = False
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to send order: {str(e)}")
+
+        st.markdown("---")
+
     with chat_container:
         rendered_batch_ids = set()
 

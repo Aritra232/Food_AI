@@ -219,6 +219,22 @@ def _find_desserts_for_restaurant(restaurant_id, profile, exclude_menu_ids=None)
     return dessert_items
 
 
+def _get_cart_restaurant_id(cart):
+    if not cart or not cart.get("items"):
+        return None
+
+    restaurant_ids = {
+        str(item.get("restaurant_id", "") or "").strip()
+        for item in cart.get("items", [])
+        if item.get("restaurant_id")
+    }
+
+    if len(restaurant_ids) == 1:
+        return next(iter(restaurant_ids))
+
+    return None
+
+
 def _find_global_dessert_recommendations(user_id, relax_dietary=False):
     return recommend_foods(user_id, "dessert", relax_dietary=relax_dietary)
 
@@ -413,6 +429,73 @@ def home():
 
 
 # -------------------------
+# ORDER WITH AI
+@app.post("/order-with-ai")
+def order_with_ai(user_id: str, restaurant_id: str = None, lat: float = None, lng: float = None, chat_session_id: str = None):
+    profile = get_user_profile(user_id) or {}
+    cart = get_cart(user_id) or {"items": []}
+
+    if not restaurant_id:
+        restaurant_id = _get_cart_restaurant_id(cart)
+
+    if cart.get("items"):
+        item_names = ", ".join([str(item.get("food_name", "item")) for item in cart.get("items", [])])
+        order_prompt = (
+            f"I found {len(cart.get('items'))} items in your cart: {item_names}. "
+            f"Let's confirm this order with AI."
+        )
+    else:
+        order_prompt = (
+            "Let's start your AI order confirmation. Tell me what you'd like to order today, "
+            "and I will guide you through the recommendation and checkout process."
+        )
+
+    add_message(user_id, "assistant", order_prompt, chat_session_id)
+    set_state(user_id, "order_confirmation")
+
+    if restaurant_id:
+        exclude_menu_ids = [item.get("menu_id") for item in cart.get("items", []) if item.get("menu_id")]
+        dessert_items = _find_desserts_for_restaurant(restaurant_id, profile, exclude_menu_ids=exclude_menu_ids)
+
+        if dessert_items:
+            dessert_recommendations = _attach_restaurant_names(dessert_items[:5])
+            recommendation_batch_id = uuid4().hex
+            options_text, options_map = format_options(dessert_recommendations)
+
+            save_options(
+                user_id,
+                options_map,
+                original_query="order_with_ai",
+                recommendation_batch_id=recommendation_batch_id
+            )
+            save_last_instruction_context(user_id, restaurant_id)
+
+            ai_response = generate_recommendation_response(
+                "I found these dessert options from the same restaurant. Would you like to add one of them to your order?",
+                dessert_recommendations,
+                user_preferences=profile.get("preferences", {})
+            )
+
+            return {
+                "intent": "order_with_ai",
+                "state": "order_confirmation",
+                "message": order_prompt,
+                "ai_response": ai_response,
+                "recommendations": dessert_recommendations,
+                "restaurant_id": restaurant_id,
+                "recommendation_batch_id": recommendation_batch_id,
+                "cart": cart
+            }
+
+    return {
+        "intent": "order_with_ai",
+        "state": "order_confirmation",
+        "message": order_prompt,
+        "cart": cart
+    }
+
+
+# -------------------------
 # PROFILE
 # -------------------------
 @app.get("/profile")
@@ -487,6 +570,18 @@ def food_search(food: str):
         formatted.append(item)
 
     return formatted
+
+
+@app.get("/food-items")
+def list_food_items(limit: int = 12):
+    cursor = menu_collection.find({"available": True}).limit(limit)
+    items = []
+    for item in cursor:
+        if item.get("_id") is not None:
+            item["_id"] = str(item["_id"])
+        items.append(item)
+
+    return _attach_restaurant_names(items)
 
 
 @app.get("/semantic-search")
@@ -1213,6 +1308,36 @@ def view_cart(user_id: str):
     return {
         "cart": cart,
         "total_price": total_price
+    }
+
+
+@app.post("/cart/add-item")
+def add_cart_item(user_id: str, data: dict):
+    menu_id = data.get("menu_id")
+    quantity = int(data.get("quantity", 1) or 1)
+
+    if not menu_id:
+        raise HTTPException(status_code=400, detail="menu_id is required")
+
+    menu_item = menu_collection.find_one({"menu_id": menu_id, "available": True})
+    if not menu_item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+
+    cart_item = {
+        "menu_id": menu_item.get("menu_id"),
+        "food_name": menu_item.get("food_name"),
+        "price": float(menu_item.get("price", 0) or 0),
+        "quantity": quantity,
+        "restaurant_id": menu_item.get("restaurant_id"),
+        "category": menu_item.get("category", "")
+    }
+
+    add_to_cart(user_id, cart_item)
+    cart = get_cart(user_id)
+
+    return {
+        "message": "Item added to cart",
+        "cart": cart
     }
 
 

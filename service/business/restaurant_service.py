@@ -161,22 +161,23 @@ def get_location_based_menus(user_lat, user_lng, query):
 
     results = []
 
-    query_lower = query.lower()
+    query_lower = query.lower().strip()
     query_terms = [
         term
         for term in re.findall(r"\w+", query_lower)
         if len(term) > 2
     ]
 
-    for item in menus:
+    generic_queries = {"food", "popular", "nearby", "available", "all", "menu", "menus", "dish", "dishes"}
+    should_return_all = not query_lower or query_lower in generic_queries
 
+    for item in menus:
         food_name_lower = item.get("food_name", "").lower()
 
-        if (
+        if should_return_all or (
             query_lower in food_name_lower or
             any(term in food_name_lower for term in query_terms)
         ):
-
             item["_id"] = str(item["_id"])
             results.append(item)
 

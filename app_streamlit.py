@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import requests
 import json
@@ -123,6 +124,22 @@ if "awaiting_order_summary_prompt" not in st.session_state:
     st.session_state.awaiting_order_summary_prompt = False
 if "restaurant_request_created" not in st.session_state:
     st.session_state.restaurant_request_created = None
+if "food_chat_recommendations" not in st.session_state:
+    st.session_state.food_chat_recommendations = []
+if "food_chat_quantities" not in st.session_state:
+    st.session_state.food_chat_quantities = {}
+if "available_foods" not in st.session_state:
+    st.session_state.available_foods = []
+if "available_foods_qty" not in st.session_state:
+    st.session_state.available_foods_qty = {}
+if "quick_recommendations" not in st.session_state:
+    st.session_state.quick_recommendations = []
+if "quick_recommendations_qty" not in st.session_state:
+    st.session_state.quick_recommendations_qty = {}
+if "show_quick_recommendations" not in st.session_state:
+    st.session_state.show_quick_recommendations = False
+if "show_chat_history" not in st.session_state:
+    st.session_state.show_chat_history = False
 
 # Sidebar - User Settings
 st.sidebar.title("👤 User Settings")
@@ -146,6 +163,7 @@ if st.sidebar.button("New chat", use_container_width=True):
     st.session_state.awaiting_delivery_address_prompt = False
     st.session_state.delivery_address_input_open = False
     st.session_state.awaiting_order_summary_prompt = False
+    st.session_state.show_chat_history = False
     st.rerun()
 
 try:
@@ -194,6 +212,178 @@ def _reset_recommendation_state():
     st.session_state.recommendation_history = []
     st.session_state.option_quantities = {}
     st.session_state.active_recommendation_batch_id = None
+
+
+def _load_food_chat_recommendations():
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/recommend-food",
+            params={
+                "user_id": user_id,
+                "food": "popular",
+                "lat": lat,
+                "lng": lng
+            },
+            timeout=12
+        )
+        if response.status_code == 200:
+            return response.json() or []
+    except Exception:
+        pass
+    return []
+
+
+def _load_available_foods():
+    """Load all available foods from nearby restaurants."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/available-foods",
+            params={
+                "user_id": user_id,
+                "lat": lat,
+                "lng": lng,
+                "limit": 50
+            },
+            timeout=12
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("foods", [])
+    except Exception:
+        pass
+    return []
+
+
+def _load_quick_recommendations():
+    """Load quick recommendations from the nearest location."""
+    return _load_available_foods()[:8]
+
+
+def _order_with_ai(menu_id, quantity, food_name, chat_mode=False):
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/order-with-ai",
+            params={
+                "user_id": user_id,
+                "menu_id": menu_id,
+                "quantity": quantity,
+                "chat_mode": str(chat_mode).lower(),
+                "lat": lat,
+                "lng": lng,
+                "chat_session_id": st.session_state.get("active_chat_session_id")
+            },
+            timeout=15
+        )
+        if response.status_code != 200:
+            return None, f"Error: {response.status_code}\n{response.text}"
+
+        result = response.json()
+        assistant_text = _extract_assistant_text(result)
+        if assistant_text:
+            st.session_state.last_assistant_response = assistant_text
+
+        if result.get("recommendations"):
+            try:
+                _append_recommendation_batch(result, assistant_text)
+            except Exception:
+                batch_id = result.get("recommendation_batch_id") or uuid4().hex
+                batch_entry = {
+                    "batch_id": batch_id,
+                    "assistant_text": assistant_text or "",
+                    "recommendations": result.get("recommendations", [])[:5]
+                }
+                st.session_state.recommendation_history = st.session_state.recommendation_history + [batch_entry]
+                st.session_state.current_recommendations = batch_entry["recommendations"]
+                st.session_state.active_recommendation_batch_id = batch_id
+
+        _refresh_chat_history()
+        st.session_state.show_chat_history = True
+        return result, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _render_recommendation_tab():
+    """Render the Recommendation tab with nearby food options and the chat-start section."""
+    if "available_foods" not in st.session_state:
+        st.session_state.available_foods = []
+    if "available_foods_qty" not in st.session_state:
+        st.session_state.available_foods_qty = {}
+
+    if not st.session_state.available_foods:
+        st.session_state.available_foods = _load_available_foods()
+
+    st.markdown("---")
+    st.subheader("🍽️ Available Food")
+    st.markdown(
+        "Browse all available foods from nearby restaurants. Click 'Order with AI' to start a new AI order chat and confirm the item."
+    )
+
+
+    foods = st.session_state.available_foods or []
+    if not foods:
+        st.info("No nearby available foods found. Try changing your location.")
+        return
+
+    for index, item in enumerate(foods):
+        item_key = str(item.get("menu_id") or f"avail_{index}")
+        quantity_key = f"avail_food_qty_{item_key}"
+        qty = st.session_state.available_foods_qty.get(quantity_key, 1)
+        st.session_state.available_foods_qty.setdefault(quantity_key, qty)
+
+        with st.container():
+            col_left, col_right = st.columns([3, 2])
+            
+            with col_left:
+                restaurant_name = item.get("restaurant_name") or item.get("restaurant_id") or "Unknown"
+                st.markdown(
+                    f"**{item.get('food_name', 'Unknown')}** · ₹{item.get('price', 'N/A')}<br>"
+                    f"<small>{restaurant_name} • {item.get('category', 'Food')}</small>",
+                    unsafe_allow_html=True
+                )
+                if item.get("description"):
+                    st.caption(item.get("description"))
+
+            with col_right:
+                col1, col2, col3 = st.columns([1, 1, 1.6])
+                with col1:
+                    if col1.button("-", key=f"avail_minus_{item_key}"):
+                        st.session_state.available_foods_qty[quantity_key] = max(1, qty - 1)
+                        st.rerun()
+                with col2:
+                    st.metric("Qty", qty)
+                with col3:
+                    if col3.button("Order with AI", key=f"avail_order_{item_key}"):
+                        st.session_state.active_chat_session_id = f"draft-{uuid4().hex}"
+                        st.session_state.chat_history = []
+                        st.session_state.current_recommendations = []
+                        st.session_state.recommendation_history = []
+                        st.session_state.option_quantities = {}
+                        st.session_state.active_recommendation_batch_id = None
+                        st.session_state.last_assistant_response = ""
+                        st.session_state.show_chat_history = False
+
+                        result, error = _order_with_ai(
+                            item.get('menu_id'),
+                            st.session_state.available_foods_qty[quantity_key],
+                            item.get('food_name'),
+                            chat_mode=False
+                        )
+                        if error:
+                            st.error(error)
+                        else:
+                            st.success(f"Started order for {item.get('food_name')}.")
+                            st.session_state.available_foods = []
+                            st.session_state.show_chat_history = True
+                            st.rerun()
+
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                if col_a.button("+", key=f"avail_plus_{item_key}"):
+                    st.session_state.available_foods_qty[quantity_key] = qty + 1
+                    st.rerun()
+
+        st.divider()
 
 
 CUISINE_OPTIONS = [
@@ -398,7 +588,7 @@ def _render_onboarding_success():
 
     col_primary, col_secondary = st.columns(2)
     with col_primary:
-        if st.button("Start Ordering with AI", use_container_width=True):
+        if st.button("Start Food Chat", use_container_width=True):
             st.session_state.onboarding_show_success = False
             st.rerun()
     with col_secondary:
@@ -889,6 +1079,17 @@ def _assistant_text_matches(batch_text, message_text):
     return batch_text_norm == message_text_norm or batch_text_norm in message_text_norm or message_text_norm in batch_text_norm
 
 
+def _strip_recommendation_details(text):
+    if not text:
+        return text
+
+    marker = re.search(r"(?:\n|\r\n|\r|\s)(?:\*\*\s*)?Option\s+[A-Z]\b|(?:\n|\r\n|\r|\s)[A-Z]:", text)
+    if marker:
+        stripped = text[:marker.start()].strip()
+        return stripped or text
+    return text
+
+
 def _render_recommendation_batch(batch):
     recommendations = batch.get("recommendations", []) or []
     batch_id = batch.get("batch_id") or "batch"
@@ -945,16 +1146,30 @@ def _render_recommendation_batch(batch):
                         st.rerun()
 
 
-def _render_recommendations_for_message(msg, rendered_batch_ids):
+def _render_recommendation_batch_for_text(text, rendered_batch_ids):
     for batch in st.session_state.recommendation_history:
-        if batch.get("batch_id") in rendered_batch_ids:
+        batch_id = batch.get("batch_id")
+        if not batch_id or batch_id in rendered_batch_ids:
             continue
 
-        if _assistant_text_matches(batch.get("assistant_text", ""), msg["content"]):
+        if _assistant_text_matches(batch.get("assistant_text", ""), text):
+            st.markdown(f"""
+                <div class="assistant-message">
+                <b>🤖 Assistant:</b> {text}
+                </div>
+            """, unsafe_allow_html=True)
             _render_recommendation_batch(batch)
-            rendered_batch_ids.add(batch.get("batch_id"))
+            rendered_batch_ids.add(batch_id)
+            return True
 
-    return rendered_batch_ids
+    return False
+
+
+def _render_recommendations_for_message(msg, rendered_batch_ids):
+    if msg.get("role") != "assistant":
+        return False
+
+    return _render_recommendation_batch_for_text(msg.get("content", ""), rendered_batch_ids)
 
 
 def _render_remaining_recommendation_batches(rendered_batch_ids):
@@ -1104,17 +1319,18 @@ if current_profile and not _profile_is_onboarded(current_profile):
     st.stop()
 
 # Create tabs
-tab1, tab2, tab3 = st.tabs(["💬 Chat", "👤 Profile", "🛒 Cart"])
+tab1, tab2, tab3, tab4 = st.tabs(["🍽️ Food Chat", "👤 Profile", "🛒 Cart", "🧠 Recommendation"])
 
 # ==================== CHAT TAB ====================
 with tab1:
-    st.subheader("Chat with Food AI Assistant")
+    st.subheader("💬 Chat with Food AI Assistant")
+    st.markdown("Click 'Load Chat History' to view your previous conversation. You can still send a new message anytime.")
     
     # Display chat history
     chat_container = st.container()
     
     # Fetch chat history
-    if st.button("🔄 Refresh Chat History"):
+    if st.button("🔄 Load Chat History", use_container_width=True):
         try:
             response = requests.get(
                 f"{API_BASE_URL}/chat-history",
@@ -1130,38 +1346,45 @@ with tab1:
                 if data.get("chat_session_id"):
                     st.session_state.active_chat_session_id = data.get("chat_session_id")
                 st.session_state.user_profile = data["user_profile"]
+                st.session_state.show_chat_history = True
                 st.success("Chat history loaded!")
         except Exception as e:
             st.error(f"Error loading chat history: {str(e)}")
     
-# Display conversation with inline recommendations
-    with chat_container:
-        rendered_batch_ids = set()
+    rendered_batch_ids = set()
+    if st.session_state.show_chat_history or st.session_state.last_assistant_response:
+        with chat_container:
+            if st.session_state.show_chat_history:
+                for msg in st.session_state.chat_history:
+                    if msg["role"] == "user":
+                        st.markdown(f"""
+                            <div class="user-message">
+                            <b>You:</b> {msg['content']}
+                            </div>
+                        """, unsafe_allow_html=True)
+                        continue
 
-        for msg in st.session_state.chat_history:
-            if msg["role"] == "user":
-                st.markdown(f"""
-                    <div class="user-message">
-                    <b>You:</b> {msg['content']}
-                    </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                    <div class="assistant-message">
-                    <b>🤖 Assistant:</b> {msg['content']}
-                    </div>
-                """, unsafe_allow_html=True)
+                    if _render_recommendations_for_message(msg, rendered_batch_ids):
+                        continue
 
-                rendered_batch_ids = _render_recommendations_for_message(msg, rendered_batch_ids)
+                    st.markdown(f"""
+                        <div class="assistant-message">
+                        <b>🤖 Assistant:</b> {msg['content']}
+                        </div>
+                    """, unsafe_allow_html=True)
 
-        _render_remaining_recommendation_batches(rendered_batch_ids)
-    
-        if not st.session_state.recommendation_history and st.session_state.current_recommendations:
-            _render_recommendation_batch({
-                "batch_id": st.session_state.active_recommendation_batch_id or "active_batch",
-                "assistant_text": st.session_state.last_assistant_response,
-                "recommendations": st.session_state.current_recommendations
-            })
+            if (not st.session_state.show_chat_history or not st.session_state.chat_history) and st.session_state.last_assistant_response:
+                if not _render_recommendation_batch_for_text(st.session_state.last_assistant_response, rendered_batch_ids):
+                    st.markdown(f"""
+                        <div class="assistant-message">
+                        <b>🤖 Assistant:</b> {st.session_state.last_assistant_response}
+                        </div>
+                    """, unsafe_allow_html=True)
+
+    else:
+        st.info("Chat history is hidden. Click 'Load Chat History' to view it.")
+
+    _render_remaining_recommendation_batches(rendered_batch_ids)
 
     col1, col2 = st.columns([4, 1])
     with col1:
@@ -1384,6 +1607,9 @@ with tab3:
     except Exception as e:
         st.error(f"Error loading cart: {str(e)}")
 
+# ==================== RECOMMENDATION TAB ====
+with tab4:
+        _render_recommendation_tab()
 # Footer
 st.markdown("---")
 st.markdown("""

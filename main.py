@@ -102,6 +102,34 @@ def _extract_remove_item_name(message):
     return None
 
 
+def _parse_quantity(message):
+    text = (message or "").lower()
+    digits = re.findall(r"\b\d+\b", text)
+    if digits:
+        try:
+            return int(digits[0])
+        except ValueError:
+            pass
+
+    number_words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10
+    }
+    for word, value in number_words.items():
+        if re.search(rf"\b{word}\b", text):
+            return value
+
+    return None
+
+
 def _get_dessert_terms_regex():
     return r"ice|ice cream|kulfi|cake|pie|mousse|cheesecake|gulab|jamun|sundae|pudding|brownie|pastry|gelato|dessert|sweet"
 
@@ -529,6 +557,101 @@ def ai_recommend(user_id: str, food: str, lat: float = None, lng: float = None):
     }
 
 
+@app.get("/available-foods")
+def get_available_foods(user_id: str, lat: float = None, lng: float = None, limit: int = 20):
+    """Get all available foods from nearby restaurants based on user location."""
+    if lat is None or lng is None:
+        return {"foods": []}
+
+    try:
+        from service.business import get_nearby_restaurants
+        
+        nearby_restaurants = get_nearby_restaurants(lat, lng)
+        
+        if not nearby_restaurants:
+            return {"foods": []}
+
+        restaurant_ids = [
+            str(r.get("restaurant_id", "")).strip()
+            for r in nearby_restaurants
+            if str(r.get("restaurant_id", "")).strip()
+        ]
+
+        if not restaurant_ids:
+            return {"foods": []}
+
+        menus = list(menu_collection.find({
+            "restaurant_id": {"$in": restaurant_ids},
+            "available": True
+        }).limit(int(limit)))
+
+        for item in menus:
+            item["_id"] = str(item.get("_id", ""))
+
+        foods = _attach_restaurant_names(menus)
+        
+        return {"foods": foods, "count": len(foods)}
+    except Exception as e:
+        return {"foods": [], "error": str(e)}
+
+
+@app.post("/order-with-ai")
+def order_with_ai(user_id: str, menu_id: str, quantity: int = 1, chat_mode: bool = False, lat: float = None, lng: float = None, chat_session_id: str = None):
+    if not menu_id:
+        raise HTTPException(status_code=400, detail="menu_id is required")
+
+    menu_item = menu_collection.find_one({"menu_id": menu_id})
+    if not menu_item:
+        try:
+            menu_item = menu_collection.find_one({"_id": ObjectId(menu_id)})
+        except Exception:
+            menu_item = None
+
+    if not menu_item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+
+    requested_quantity = 0 if chat_mode else max(1, int(quantity or 1))
+    cart_item = {
+        "menu_id": menu_item.get("menu_id"),
+        "food_name": menu_item.get("food_name"),
+        "price": menu_item.get("price", 0),
+        "quantity": requested_quantity,
+        "restaurant_id": menu_item.get("restaurant_id"),
+        "category": menu_item.get("category"),
+        "description": menu_item.get("description")
+    }
+
+    save_selected_item(user_id, cart_item)
+    save_last_instruction_context(user_id, menu_item.get("restaurant_id"))
+    set_state(user_id, "awaiting_quantity" if chat_mode else "selected")
+
+    user_message = f"Order request: {cart_item['food_name']} x{requested_quantity if requested_quantity else ''}".strip()
+    add_message(user_id, "user", user_message, chat_session_id)
+
+    if chat_mode:
+        confirm_msg = (
+            f"Sure — I have {cart_item['food_name']} ready. "
+            "How many would you like?"
+        )
+        response_intent = "chat"
+        response_state = "awaiting_quantity"
+    else:
+        confirm_msg = (
+            f"Great, I have {cart_item['food_name']} x{requested_quantity} ready. "
+            "Say 'yes' to confirm and add it to your cart."
+        )
+        response_intent = "select"
+        response_state = "selected"
+
+    add_message(user_id, "assistant", confirm_msg, chat_session_id)
+
+    return {
+        "intent": response_intent,
+        "state": response_state,
+        "message": confirm_msg,
+        "selected_item": cart_item
+    }
+
 
 @app.post("/sync-pinecone")
 def sync_pinecone():
@@ -651,6 +774,36 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
     state = get_state(user_id)
     profile = get_user_profile(user_id)
     allergies = profile.get("preferences", {}).get("allergies", [])
+
+    if state == "awaiting_quantity":
+        quantity = _parse_quantity(message)
+        if quantity and quantity > 0:
+            selected_item = get_selected_item(user_id)
+            if selected_item:
+                selected_item["quantity"] = quantity
+                save_selected_item(user_id, selected_item)
+                set_state(user_id, "selected")
+
+                confirm_msg = (
+                    f"Got it. {quantity} x {selected_item.get('food_name')} ready. "
+                    "Say 'yes' to confirm and add it to your cart."
+                )
+                add_message(user_id, "user", message, chat_session_id)
+                add_message(user_id, "assistant", confirm_msg, chat_session_id)
+
+                return {
+                    "intent": "chat",
+                    "state": "selected",
+                    "message": confirm_msg
+                }
+
+        prompt_msg = "How many would you like? Please tell me a number."
+        add_message(user_id, "assistant", prompt_msg, chat_session_id)
+        return {
+            "intent": "chat",
+            "state": "awaiting_quantity",
+            "message": prompt_msg
+        }
 
     # -------------------------
     # CASE 4: NORMAL CHAT

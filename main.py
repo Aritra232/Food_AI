@@ -773,6 +773,14 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
     intent = detect_intent(message)
     state = get_state(user_id)
     profile = get_user_profile(user_id)
+
+    # If the user previously selected an item and now replies with a confirmation
+    # like 'yes' or 'confirm', interpret that as a checkout intent even if the
+    # classifier returned something else. This prevents 'yes' being misclassified
+    # as a selection and causing an "Invalid option selected" error.
+    if state == "selected" and isinstance(message, str) and any(w in message.lower() for w in ["yes", "confirm", "okay"]):
+        intent = "checkout"
+
     allergies = profile.get("preferences", {}).get("allergies", [])
 
     if state == "awaiting_quantity":

@@ -325,40 +325,10 @@ def _extract_favorite_foods_from_text(text):
     text = str(text).strip()
     # replace common apostrophes so contractions like "J'aime" become "J aime"
     text = text.replace("'", " ").replace("’", " ")
-    favorites = []
-    patterns = [
-        r"\b(?:i|we|they|he|she|j|yo|eu)?\s*(?:really\s+|absolutely\s+|also\s+)?(?:like|love|enjoy|prefer|want|want to have|want some|want a|want an|crave|craving|posondo|favorite|favourite|aime|gusta|quiero|gosto|gosto|amo|adoro|piace)\s+([a-zA-Z0-9 ,&\-]+?)(?:\s*(?:and|but|because|that|with|from|for|$))",
-        r"\b([a-zA-Z0-9 ,&\-]+?)\s+is my (?:favorite|favourite|preferred)\b",
-        r"\b([a-zA-Z0-9 ,&\-]+?)\s+always\s+(?:loved by me|is loved by me|hits the spot(?: for me)?|is the best(?: for me)?|is great(?: for me)?|is amazing(?: for me)?|is awesome(?: for me)?)\b",
-        r"\b(?:always|forever|constantly)\s+(?:love|loved|enjoy|enjoyed|crave|craving|prefer)\s+([a-zA-Z0-9 ,&\-]+?)(?:\s*(?:and|but|because|that|with|from|for|$))"
-    ]
 
-    for pattern in patterns:
-        matches = re.findall(pattern, text, flags=re.IGNORECASE)
-        for match in matches:
-            if isinstance(match, tuple):
-                match = match[-1]
-            if not match:
-                continue
-            candidates = re.split(r",| and | & |/|;|\\|", match, flags=re.IGNORECASE)
-            for item in candidates:
-                cleaned = re.sub(r"[^a-zA-Z0-9\- ]", "", item or "").strip()
-                if cleaned and not re.search(r"\b(allergy|allergic|intolerant|reaction|cannot eat|can't eat|hate|dislike|not a fan)\b", cleaned, flags=re.IGNORECASE):
-                    favorites.append(cleaned)
-
-    deduped = []
-    seen = set()
-    for item in favorites:
-        normalized = item.strip()
-        if not normalized:
-            continue
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(normalized)
-
-    return deduped
+    # Use only the Claude prompt-based favorite food extractor.
+    # Do not fall back to regex heuristics for favorite food extraction.
+    return _extract_favorite_foods_with_claude(text)
 
 
 def _parse_disliked_foods_response(text):
@@ -375,6 +345,26 @@ def _parse_disliked_foods_response(text):
         return [str(item).strip() for item in parsed if str(item).strip()]
     if isinstance(parsed, dict):
         return _normalize_output_list(parsed.get("disliked_foods"))
+    if isinstance(parsed, str) and parsed.strip():
+        return [parsed.strip()]
+
+    return []
+
+
+def _parse_favorite_foods_response(text):
+    if not text:
+        return []
+
+    text = str(text).strip()
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = _extract_json_object(text)
+
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    if isinstance(parsed, dict):
+        return _normalize_output_list(parsed.get("favorite_foods"))
     if isinstance(parsed, str) and parsed.strip():
         return [parsed.strip()]
 
@@ -412,6 +402,40 @@ User message:
     )
 
     return _parse_disliked_foods_response(response_text)
+
+
+def _extract_favorite_foods_with_claude(text):
+    if not text:
+        return []
+
+    prompt = f"""Extract only the favorite food items from the following user message.
+Return ONLY a JSON array of foods or drinks the user explicitly or implicitly indicates are their favorite, preferred, liked, loved, or enjoyed items.
+Do NOT treat simple desire phrases such as 'I want rice' or 'I want burger' as favorite foods unless the user also describes them with favorite/like language.
+Do not include dislikes, allergies, intolerances, dietary restrictions, brands, or generic terms like 'food' or 'anything'.
+If there are no favorite foods, return [] exactly.
+
+Examples:
+- "I like rice and burger." -> ["rice", "burger"]
+- "Rice is my favorite." -> ["rice"]
+- "I love sushi." -> ["sushi"]
+- "I enjoy pasta." -> ["pasta"]
+- "I would like rice." -> []
+- "I need sushi." -> []
+- "I want rice, I want burger." -> []
+- "I want rice, but I really like fries." -> ["fries"]
+
+User message:
+{text}
+"""
+
+    response_text = chat_with_claude(
+        messages=[{"role": "user", "content": prompt}],
+        system_prompt="You are an assistant that extracts favorite food items from user text.",
+        temperature=0,
+        max_tokens=256
+    )
+
+    return _parse_favorite_foods_response(response_text)
 
 
 def _extract_disliked_foods_from_text(text):
@@ -475,7 +499,8 @@ Return ONLY valid JSON. Be precise and careful about allergies vs dislikes.
 Key rules:
 - Allergies are health/safety concerns (user says: allergic, intolerant, reaction)
 - Disliked foods are taste preferences (user says: don't like, hate, not a fan)
-- Favorite foods are items the user likes, loves, enjoys, prefers, or wants
+- Favorite foods are items the user likes, loves, enjoys, prefers, or explicitly indicates are favorites.
+- Do NOT treat simple desire or ordering phrases such as "I want", "I would like", "I need", "I would love", or "Can I have" as favorite foods unless the user also clearly expresses liking, preference, or favorite sentiment.
 - Never put allergy items in "disliked_foods"
 - For dietary preferences (vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, low-carb), normalize to the exact term
 - If user says "both", "all of them", "these", resolve to exact items from context

@@ -44,30 +44,62 @@ def extract_preferences_claude(user_message, conversation_history=None, existing
     through complex dietary restrictions and allergy mentions.
     """
     import json
-    import re
     
     def _expand_user_shorthand(message):
         if not message:
             return ""
+
         text = str(message)
-        replacements = [
-            (r"\b(fvrt|favrt|fvt|fav)\b", "favorite"),
-            (r"\b(dslk|dlike|dislk|dontlike|donotlike|dntlike)\b", "dislike"),
-            (r"\b(algy|allrgy|allergy|allergic)\b", "allergy"),
-            (r"\b(cuis|cuisn|cusine|cuisine)\b", "cuisine"),
-            (r"\b(diet|dtry)\b", "dietary"),
-            (r"\b(restr|restn|restrn)\b", "restriction"),
-            (r"\b(spcy|spci|spicey)\b", "spicy"),
-            (r"\b(bgt|budgt|bdgt)\b", "budget"),
-            (r"\b(freq|frq)\b", "frequency"),
-            (r"\b(addr|addrs|adress)\b", "address"),
-            (r"\b(brkfst|bf)\b", "breakfast"),
-            (r"\b(lnch|lunc)\b", "lunch"),
-            (r"\b(dinr|dnr)\b", "dinner")
+
+        prompt = f"""You are a normalization assistant for food preference extraction.
+Rewrite the user message by replacing shorthand, abbreviations, slang, alternate spellings, non-English variants, and other informal wording
+with canonical terms that a food preference extractor can understand.
+
+Keep the original meaning exactly the same.
+Return ONLY the rewritten text, without explanations.
+
+Examples:
+- fvrt, favrt, fvt, fav, favorita -> favorite
+- dslk, dislk, dlike, don't like, dontlike -> dislike
+- algy, allrgy, allergy, allergic -> allergy
+- cuis, cuisn, cusine -> cuisine
+- dtry -> dietary
+- restr, restn, restrn -> restriction
+- spcy, spci, spicey -> spicy
+- bgt, budgt, bdgt -> budget
+- freq, frq -> frequency
+- addr, addrs, adress -> address
+- brkfst, bf -> breakfast
+- lnch, lunc -> lunch
+- dinr, dnr -> dinner
+- posondo, like, favorita -> favorite
+- If a word is already plain English, preserve it.
+
+Original message:
+""" + text + """
+"""
+
+        normalization_messages = [
+            {
+                "role": "user",
+                "content": prompt
+            }
         ]
-        for pattern, replacement in replacements:
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-        return text
+
+        normalized_text = chat_with_claude(
+            messages=normalization_messages,
+            system_prompt="You are an assistant that rewrites informal user text into normalized English for downstream preference extraction.",
+            temperature=0,
+            max_tokens=256
+        )
+
+        if normalized_text and isinstance(normalized_text, str):
+            normalized_text = normalized_text.strip()
+
+        if not normalized_text:
+            return text
+
+        return normalized_text
     
     def _build_context_block(history):
         if not history:

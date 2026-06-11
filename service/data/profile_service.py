@@ -155,28 +155,17 @@ def _should_update_favorite_foods(source_message):
     if not source_message:
         return True
 
-    favorite_patterns = [
-        r"\bfavo(?:u)?rite\b",
-        r"\bfav\b",
-        r"\bfvrt\b",
-        r"\bfavrt\b",
-        r"\bfvt\b",
-        r"\bi love\b",
-        r"\bi enjoy\b",
-        r"\bprefer\b"
-    ]
-    dislike_patterns = [
-        r"\bdon'?t like\b",
-        r"\bdo not like\b",
-        r"\bdislike\b",
-        r"\bhate\b",
-        r"\bnot a fan\b"
-    ]
-
-    if _contains_pattern(source_message, dislike_patterns):
+    try:
+        extracted = extract_preferences(source_message)
+        if isinstance(extracted, dict):
+            favorite_foods = extracted.get("favorite_foods") or []
+            if favorite_foods:
+                return True
+    except Exception:
+        # If AI extraction fails, do not update favorites from this message.
         return False
 
-    return _contains_pattern(source_message, favorite_patterns)
+    return False
 
 
 def create_user_profile_if_not_exists(user_id):

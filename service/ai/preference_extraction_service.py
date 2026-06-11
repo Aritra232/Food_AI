@@ -4,6 +4,8 @@ import os
 import json
 import re
 
+from .claude_service import chat_with_claude
+
 load_dotenv()
 
 client = Anthropic(
@@ -119,35 +121,82 @@ def _expand_user_shorthand(message):
     if not message:
         return ""
 
-    text = str(message)
-    replacements = [
-        (r"\b(fvrt|favrt|fvrt|fvt|fav)\b", "favorite"),
-        (r"\b(dslk|dlike|dislk|dontlike|donotlike|dntlike)\b", "dislike"),
-        (r"\b(algy|allrgy|allergy|allergic)\b", "allergy"),
-        (r"\b(cuis|cuisn|cusine|cuisine)\b", "cuisine"),
-        (r"\b(diet|dtry)\b", "dietary"),
-        (r"\b(restr|restn|restrn)\b", "restriction"),
-        (r"\b(spcy|spci|spicey)\b", "spicy"),
-        (r"\b(bgt|budgt|bdgt)\b", "budget"),
-        (r"\b(freq|frq)\b", "frequency"),
-        (r"\b(addr|addrs|adress)\b", "address"),
-        (r"\b(brkfst|bf)\b", "breakfast"),
-        (r"\b(lnch|lunc)\b", "lunch"),
-        (r"\b(dinr|dnr)\b", "dinner")
+    text = str(message).strip()
+    prompt = f"""You are a text normalization assistant for food preference extraction.
+Rewrite the user message by replacing shorthand, abbreviations, slang, alternate spellings, non-English variants, and informal wording
+with canonical English terms that a preference extractor can understand.
+
+If the message is written in another language, interpret it and output the normalized English equivalent.
+Keep the original meaning exactly the same.
+Return ONLY the rewritten text, without explanations.
+
+Examples:
+- fvrt, favrt, fvrt, fvt, fav, favorita -> favorite
+- dslk, dislk, dlike, don't like, dontlike -> dislike
+- algy, allrgy, allergy, allergic -> allergy
+- cuis, cuisn, cusine -> cuisine
+- dtry -> dietary
+- restr, restn, restrn -> restriction
+- spcy, spci, spicey -> spicy
+- bgt, budgt, bdgt -> budget
+- freq, frq -> frequency
+- addr, addrs, adress -> address
+- brkfst, bf -> breakfast
+- lnch, lunc -> lunch
+- dinr, dnr -> dinner
+- posondo, like, favorita -> favorite
+- ami seafood posondo kori -> I like seafood
+- me gusta el marisco -> I like seafood
+- If a word is already plain English, preserve it.
+
+Original message:
+""" + text + """
+"""
+
+    normalizer_messages = [
+        {
+            "role": "user",
+            "content": prompt
+        }
     ]
 
-    for pattern, replacement in replacements:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    normalized_text = chat_with_claude(
+        messages=normalizer_messages,
+        system_prompt="You are an assistant that rewrites informal or multilingual user text into normalized English for downstream preference extraction.",
+        temperature=0,
+        max_tokens=256
+    )
 
-    return text
+    if normalized_text and isinstance(normalized_text, str):
+        normalized_text = normalized_text.strip()
+
+    return normalized_text or text
 
 
 def _sanitize_extracted_preferences(user_message, extracted):
     if not isinstance(extracted, dict):
         return {}
 
+    favorite_foods = _normalize_output_list(extracted.get("favorite_foods"))
     disliked = _normalize_output_list(extracted.get("disliked_foods"))
     allergies = _normalize_output_list(extracted.get("allergies"))
+
+    def _filter_noise_tokens(items):
+        filtered = []
+        for item in items:
+            if not item:
+                continue
+            token = str(item).strip()
+            if len(token) == 1 and re.fullmatch(r"[A-Za-z0-9]", token):
+                continue
+            filtered.append(token)
+        return filtered
+
+    favorite_foods = _filter_noise_tokens(favorite_foods)
+    disliked = _filter_noise_tokens(disliked)
+    allergies = _filter_noise_tokens(allergies)
+
+    extracted["favorite_foods"] = favorite_foods
 
     allergy_patterns = [
         r"\ballerg(y|ic|ies)\b",
@@ -269,6 +318,148 @@ def _extract_allergies_from_text(text):
     return deduped
 
 
+def _extract_favorite_foods_from_text(text):
+    if not text:
+        return []
+
+    text = str(text).strip()
+    # replace common apostrophes so contractions like "J'aime" become "J aime"
+    text = text.replace("'", " ").replace("’", " ")
+    favorites = []
+    patterns = [
+        r"\b(?:i|we|they|he|she|j|yo|eu)?\s*(?:really\s+|absolutely\s+|also\s+)?(?:like|love|enjoy|prefer|want|want to have|want some|want a|want an|crave|craving|posondo|favorite|favourite|aime|gusta|quiero|gosto|gosto|amo|adoro|piace)\s+([a-zA-Z0-9 ,&\-]+?)(?:\s*(?:and|but|because|that|with|from|for|$))",
+        r"\b([a-zA-Z0-9 ,&\-]+?)\s+is my (?:favorite|favourite|preferred)\b",
+        r"\b([a-zA-Z0-9 ,&\-]+?)\s+always\s+(?:loved by me|is loved by me|hits the spot(?: for me)?|is the best(?: for me)?|is great(?: for me)?|is amazing(?: for me)?|is awesome(?: for me)?)\b",
+        r"\b(?:always|forever|constantly)\s+(?:love|loved|enjoy|enjoyed|crave|craving|prefer)\s+([a-zA-Z0-9 ,&\-]+?)(?:\s*(?:and|but|because|that|with|from|for|$))"
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                match = match[-1]
+            if not match:
+                continue
+            candidates = re.split(r",| and | & |/|;|\\|", match, flags=re.IGNORECASE)
+            for item in candidates:
+                cleaned = re.sub(r"[^a-zA-Z0-9\- ]", "", item or "").strip()
+                if cleaned and not re.search(r"\b(allergy|allergic|intolerant|reaction|cannot eat|can't eat|hate|dislike|not a fan)\b", cleaned, flags=re.IGNORECASE):
+                    favorites.append(cleaned)
+
+    deduped = []
+    seen = set()
+    for item in favorites:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+
+    return deduped
+
+
+def _parse_disliked_foods_response(text):
+    if not text:
+        return []
+
+    text = str(text).strip()
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = _extract_json_object(text)
+
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    if isinstance(parsed, dict):
+        return _normalize_output_list(parsed.get("disliked_foods"))
+    if isinstance(parsed, str) and parsed.strip():
+        return [parsed.strip()]
+
+    return []
+
+
+def _extract_disliked_foods_with_claude(text):
+    if not text:
+        return []
+
+    prompt = f"""Extract only the disliked food items from the following user message.
+Return ONLY a JSON array of foods or drinks the user explicitly or implicitly says they do not like, hate,
+avoid, detest, loathe, can't stand, can't abide, dislike, are not a fan of, or use any similar expressions of dislike or aversion.
+Do not include allergies, intolerances, dietary restrictions, brands, or generic terms like "food" or "anything".
+If there are no disliked foods, return [] exactly.
+
+Examples:
+- "I don't like peanuts at all." -> ["peanuts"]
+- "I would rather starve than drink milk." -> ["milk"]
+- "Mushrooms ruin the taste of any food for me." -> ["mushrooms"]
+- "I absolutely dislike onions." -> ["onions"]
+- "Bell peppers are really not my thing." -> ["bell peppers"]
+- "I detest seafood." -> ["seafood"]
+- "I can't stand broccoli." -> ["broccoli"]
+
+User message:
+{text}
+"""
+
+    response_text = chat_with_claude(
+        messages=[{"role": "user", "content": prompt}],
+        system_prompt="You are an assistant that extracts disliked food items from user text.",
+        temperature=0,
+        max_tokens=256
+    )
+
+    return _parse_disliked_foods_response(response_text)
+
+
+def _extract_disliked_foods_from_text(text):
+    if not text:
+        return []
+
+    text = str(text).strip()
+    text = text.replace("'", " ").replace("’", " ")
+
+    disliked = _extract_disliked_foods_with_claude(text)
+    if disliked:
+        return disliked
+
+    dislikes = []
+    patterns = [
+        r"\b(?:do not like|dont like|don't like|not a fan of|not a fan|hate|dislike|can't stand|cannot stand|avoid|avoiding|avoidance of)\s+([a-zA-Z0-9 ,&\-]+?)(?:\s*(?:and|but|because|that|with|from|for|$))",
+        r"\b([a-zA-Z0-9 ,&\-]+?)\s+is not my (?:favorite|favourite|preferred)\b",
+        r"\b(?:not my favorite|not my favourite|not preferred)\s+([a-zA-Z0-9 ,&\-]+?)(?:\s*(?:and|but|because|that|with|from|for|$))"
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                match = match[-1]
+            if not match:
+                continue
+            candidates = re.split(r",| and | & |/|;|\\|", match, flags=re.IGNORECASE)
+            for item in candidates:
+                cleaned = re.sub(r"[^a-zA-Z0-9\- ]", "", item or "").strip()
+                if cleaned and not re.search(r"\b(allergy|allergic|intolerant|reaction|cannot eat)\b", cleaned, flags=re.IGNORECASE):
+                    dislikes.append(cleaned)
+
+    deduped = []
+    seen = set()
+    for item in dislikes:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+
+    return deduped
+
+
 def extract_preferences_with_context(user_message, conversation_history=None, existing_allergies=None):
     """
     Extract preferences using Claude for superior context understanding.
@@ -284,13 +475,28 @@ Return ONLY valid JSON. Be precise and careful about allergies vs dislikes.
 Key rules:
 - Allergies are health/safety concerns (user says: allergic, intolerant, reaction)
 - Disliked foods are taste preferences (user says: don't like, hate, not a fan)
+- Favorite foods are items the user likes, loves, enjoys, prefers, or wants
 - Never put allergy items in "disliked_foods"
 - For dietary preferences (vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, low-carb), normalize to the exact term
 - If user says "both", "all of them", "these", resolve to exact items from context
 - Avoid vague terms like "both" as allergy items
+- Use meaning and sentiment to determine disliked foods, not just hard keyword matching
 """
 
     prompt = f"""Extract food preferences from this user message.
+
+Example:
+- "I like seafood and I have allergy to pasta." -> favorite_foods: ["seafood"], allergies: ["pasta"]
+- "Sandwiches always hit the spot for me." -> favorite_foods: ["sandwiches"]
+- "biriyani always loved by me." -> favorite_foods: ["biriyani"]
+- "I don't like mushrooms." -> disliked_foods: ["mushrooms"]
+- "I'm not a fan of olives." -> disliked_foods: ["olives"]
+- "I hate tomatoes." -> disliked_foods: ["tomatoes"]
+- "I can't stand peanuts." -> disliked_foods: ["peanuts"]
+- "I absolutely dislike peanuts." -> disliked_foods: ["peanuts"]
+- "I detest peanuts." -> disliked_foods: ["peanuts"]
+- "I loathe peanuts." -> disliked_foods: ["peanuts"]
+- "I can't abide peanuts." -> disliked_foods: ["peanuts"]
 
 Recent conversation context:
 {context_block or "None"}
@@ -321,6 +527,8 @@ Rules:
 - If the user says they are allergic to something, put it in "allergies".
 - Do NOT place allergy items in "disliked_foods".
 - Use "disliked_foods" only for foods the user does not like.
+- Favorite food values must be whole food terms, not single letters or fragments.
+- Do not output single-character food items.
 - If the user mentions a diet such as vegan, vegetarian, halal, kosher, gluten-free, dairy-free, nut-free, keto, paleo, or low-carb, fill both "dietary_style" and "dietary_restrictions" with the best matching normalized label.
 - If the user says "both", "all of them", "these", "those", "them", or similar, resolve it to the exact allergy items from the recent conversation context.
 - Never store vague words like "both" as an allergy item.
@@ -349,22 +557,36 @@ Rules:
 
     if not isinstance(extracted, dict):
         fallback_allergies = _extract_allergies_from_text(normalized_user_message)
-        if fallback_allergies:
-            return _sanitize_extracted_preferences(normalized_user_message, {
-                "favorite_foods": [],
-                "disliked_foods": [],
-                "allergies": fallback_allergies,
-                "dietary_style": "",
-                "dietary_restrictions": [],
-                "spicy_level": "",
-                "budget_range": "",
-                "preferred_cuisines": [],
-                "favorite_restaurants": [],
-                "favorite_drinks": [],
-                "delivery_speed_preference": "",
-                "preferred_meal_time": []
-            })
-        return {}
+        fallback_favorites = _extract_favorite_foods_from_text(normalized_user_message)
+        fallback_dislikes = _extract_disliked_foods_from_text(normalized_user_message)
+        return _sanitize_extracted_preferences(normalized_user_message, {
+            "favorite_foods": fallback_favorites,
+            "disliked_foods": fallback_dislikes,
+            "allergies": fallback_allergies,
+            "dietary_style": "",
+            "dietary_restrictions": [],
+            "spicy_level": "",
+            "budget_range": "",
+            "preferred_cuisines": [],
+            "favorite_restaurants": [],
+            "favorite_drinks": [],
+            "delivery_speed_preference": "",
+            "preferred_meal_time": []
+        })
+
+    favorite_foods = _normalize_output_list(extracted.get("favorite_foods"))
+    extracted["favorite_foods"] = favorite_foods
+    if not favorite_foods:
+        inferred_favorites = _extract_favorite_foods_from_text(normalized_user_message)
+        if inferred_favorites:
+            extracted["favorite_foods"] = inferred_favorites
+
+    disliked_foods = _normalize_output_list(extracted.get("disliked_foods"))
+    extracted["disliked_foods"] = disliked_foods
+    if not disliked_foods:
+        inferred_dislikes = _extract_disliked_foods_from_text(normalized_user_message)
+        if inferred_dislikes:
+            extracted["disliked_foods"] = inferred_dislikes
 
     if existing_allergies:
         normalized_existing = [str(item).strip() for item in existing_allergies if str(item).strip()]

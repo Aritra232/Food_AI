@@ -288,34 +288,64 @@ def _extract_allergies_from_text(text):
         return []
 
     text = str(text).strip()
-    patterns = [
-        r"(?:allerg(?:y|ic) to|intolerant to|intolerance to|reaction to|can(?:'t| not) eat|cannot eat)\s+([a-z0-9 ,&\-]+)",
-    ]
-    allergies = []
+    # replace common apostrophes so contractions like "J'aime" become "J aime"
+    text = text.replace("'", " ").replace("'", " ")
 
-    for pattern in patterns:
-        matches = re.findall(pattern, text, flags=re.IGNORECASE)
-        for match in matches:
-            if isinstance(match, tuple):
-                match = match[-1]
-            for item in re.split(r",| and | & |/|;|\\band\\b", match, flags=re.IGNORECASE):
-                cleaned = re.sub(r"[^a-zA-Z0-9\- ]", "", item or "").strip()
-                if cleaned:
-                    allergies.append(cleaned)
+    # Use only the Claude prompt-based allergy extractor.
+    # Do not fall back to regex heuristics for allergy extraction.
+    return _extract_allergies_with_claude(text)
 
-    deduped = []
-    seen = set()
-    for item in allergies:
-        normalized = item.strip()
-        if not normalized:
-            continue
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(normalized)
 
-    return deduped
+def _parse_allergies_response(text):
+    if not text:
+        return []
+
+    text = str(text).strip()
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = _extract_json_object(text)
+
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    if isinstance(parsed, dict):
+        return _normalize_output_list(parsed.get("allergies"))
+    if isinstance(parsed, str) and parsed.strip():
+        return [parsed.strip()]
+
+    return []
+
+
+def _extract_allergies_with_claude(text):
+    if not text:
+        return []
+
+    prompt = f"""Extract only the food allergies or intolerances from the following user message.
+Return ONLY a JSON array of foods or drinks the user explicitly says they are allergic to, intolerant to, or have a reaction to.
+Do NOT include dislikes, foods the user avoids for preference reasons, dietary restrictions, brands, or generic terms like 'food' or 'anything'.
+If there are no allergies, return [] exactly.
+
+Examples:
+- "I am allergic to peanuts." -> ["peanuts"]
+- "I have an allergy to shellfish." -> ["shellfish"]
+- "I'm intolerant to dairy." -> ["dairy"]
+- "I cannot eat gluten." -> ["gluten"]
+- "I have a reaction to nuts." -> ["nuts"]
+- "I don't like mushrooms." -> []
+- "I am vegan." -> []
+
+User message:
+{text}
+"""
+
+    response_text = chat_with_claude(
+        messages=[{"role": "user", "content": prompt}],
+        system_prompt="You are an assistant that extracts food allergies and intolerances from user text.",
+        temperature=0,
+        max_tokens=256
+    )
+
+    return _parse_allergies_response(response_text)
 
 
 def _extract_favorite_foods_from_text(text):

@@ -783,6 +783,20 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
 
     allergies = profile.get("preferences", {}).get("allergies", [])
 
+    # Always extract preferences first, before any intent-specific handling.
+    # This ensures allergies and other preferences are captured even if intent is misclassified.
+    add_message(user_id, "user", message, chat_session_id)
+    extracted_prefs = extract_preferences(
+        message,
+        conversation_history=get_conversation(user_id, chat_session_id),
+        existing_allergies=profile.get("preferences", {}).get("allergies", [])
+    )
+    if extracted_prefs:
+        update_user_preferences(user_id, extracted_prefs, source_message=message)
+        # Reload profile to get updated allergies
+        profile = get_user_profile(user_id)
+        allergies = profile.get("preferences", {}).get("allergies", [])
+
     if state == "awaiting_quantity":
         quantity = _parse_quantity(message)
         if quantity and quantity > 0:
@@ -821,7 +835,6 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
         if _is_ingredient_question(message):
             blocked_items = get_last_blocked_items(user_id)
             ingredient_reply = _build_blocked_ingredient_reply(message, blocked_items)
-            add_message(user_id, "user", message, chat_session_id)
             add_message(user_id, "assistant", ingredient_reply, chat_session_id)
             set_state(user_id, "chat")
             return {
@@ -835,7 +848,6 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
         # dessert suggestions have been offered.
         if _is_no_thanks_message(message):
             restaurant_id = get_last_instruction_context(user_id)
-            add_message(user_id, "user", message, chat_session_id)
 
             if state == "dessert_suggestion" and restaurant_id:
                 prompt_msg = (
@@ -951,19 +963,6 @@ def chat(user_id: str, message: str, lat: float = None, lng: float = None, chat_
             "message": error_msg,
             "cart": cart
         }
-
-
-    # Save user message to conversation history for order/select/checkout flow
-    add_message(user_id, "user", message, chat_session_id)
-
-    # Extract preferences from user message
-    extracted_prefs = extract_preferences(
-        message,
-        conversation_history=get_conversation(user_id, chat_session_id),
-        existing_allergies=profile.get("preferences", {}).get("allergies", [])
-    )
-    if extracted_prefs:
-        update_user_preferences(user_id, extracted_prefs, source_message=message)
 
     # -------------------------
     # CASE 1: ORDER FLOW

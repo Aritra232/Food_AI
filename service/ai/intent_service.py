@@ -56,6 +56,11 @@ def _detect_intent_fallback(message: str):
         return "modify"
 
     if any(word in lower_message for word in [
+        "allerg", "intolerant", "reaction", "cannot eat", "can't eat"
+    ]):
+        return "chat"
+
+    if any(word in lower_message for word in [
         "want", "crave", "hungry", "order", "eat"
     ]):
         return "order"

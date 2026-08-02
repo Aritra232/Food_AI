@@ -4,9 +4,12 @@ import os
 
 load_dotenv()
 
-client = Anthropic(
-    api_key=os.getenv("CLAUDE_API_KEY")
-)
+try:
+    client = Anthropic(
+        api_key=os.getenv("CLAUDE_API_KEY")
+    )
+except Exception:
+    client = None
 
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 
@@ -24,6 +27,9 @@ def chat_with_claude(messages, system_prompt=None, temperature=0.7, max_tokens=2
     Returns:
         str: Claude's response text
     """
+    if client is None:
+        return "Claude is currently unavailable because the API client could not be initialized."
+
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=max_tokens,

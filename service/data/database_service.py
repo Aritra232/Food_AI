@@ -5,13 +5,78 @@ import os
 load_dotenv()
 
 MONGO_URL = os.getenv("MONGO_URL")
+MONGO_AVAILABLE = False
+MONGO_ERROR = None
+
+
+class _FallbackCursor(list):
+    def limit(self, *_args, **_kwargs):
+        return self
+
+    def skip(self, *_args, **_kwargs):
+        return self
+
+    def sort(self, *_args, **_kwargs):
+        return self
+
+
+class _FallbackCollection:
+    def __init__(self, name):
+        self.name = name
+
+    def find_one(self, *args, **kwargs):
+        return None
+
+    def find(self, *args, **kwargs):
+        return _FallbackCursor()
+
+    def insert_one(self, document):
+        return type("InsertResult", (), {"inserted_id": None})()
+
+    def insert_many(self, documents):
+        return type("InsertManyResult", (), {"inserted_ids": []})()
+
+    def update_one(self, *args, **kwargs):
+        return type("UpdateResult", (), {"matched_count": 0, "modified_count": 0, "upserted_id": None})()
+
+    def update_many(self, *args, **kwargs):
+        return type("UpdateResult", (), {"matched_count": 0, "modified_count": 0, "upserted_id": None})()
+
+    def delete_one(self, *args, **kwargs):
+        return type("DeleteResult", (), {"deleted_count": 0})()
+
+    def delete_many(self, *args, **kwargs):
+        return type("DeleteResult", (), {"deleted_count": 0})()
+
+    def aggregate(self, *args, **kwargs):
+        return _FallbackCursor()
+
+    def count_documents(self, *args, **kwargs):
+        return 0
+
+    def distinct(self, *args, **kwargs):
+        return []
+
+
+class _FallbackDatabase:
+    def __getitem__(self, name):
+        return _FallbackCollection(name)
+
 
 if not MONGO_URL:
-	raise RuntimeError("MONGO_URL is not set in .env")
-
-client = MongoClient(MONGO_URL)
-
-db = client["food_ai_agent_db"]
+    MONGO_ERROR = "MONGO_URL is not set in .env"
+    client = None
+    db = _FallbackDatabase()
+else:
+    try:
+        client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=2000)
+        client.admin.command("ping")
+        db = client["food_ai_agent_db"]
+        MONGO_AVAILABLE = True
+    except Exception as exc:
+        MONGO_ERROR = str(exc)
+        client = None
+        db = _FallbackDatabase()
 
 # -------------------------
 # CONVERSATION MEMORY

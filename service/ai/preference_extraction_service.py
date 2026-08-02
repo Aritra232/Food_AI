@@ -8,9 +8,12 @@ from .claude_service import chat_with_claude
 
 load_dotenv()
 
-client = Anthropic(
-    api_key=os.getenv("CLAUDE_API_KEY")
-)
+try:
+    client = Anthropic(
+        api_key=os.getenv("CLAUDE_API_KEY")
+    )
+except Exception:
+    client = None
 
 
 def extract_preferences(user_message, conversation_history=None, existing_allergies=None):
@@ -588,6 +591,22 @@ Rules:
 - If the user says "both", "all of them", "these", "those", "them", or similar, resolve it to the exact allergy items from the recent conversation context.
 - Never store vague words like "both" as an allergy item.
 """
+
+    if client is None:
+        return _sanitize_extracted_preferences(normalized_user_message, {
+            "favorite_foods": [],
+            "disliked_foods": [],
+            "allergies": [],
+            "dietary_style": "",
+            "dietary_restrictions": [],
+            "spicy_level": "",
+            "budget_range": "",
+            "preferred_cuisines": [],
+            "favorite_restaurants": [],
+            "favorite_drinks": [],
+            "delivery_speed_preference": "",
+            "preferred_meal_time": []
+        })
 
     response = client.messages.create(
         model=os.getenv("CLAUDE_MODEL", "claude-opus-4-6"),

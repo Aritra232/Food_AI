@@ -6,28 +6,35 @@ import json
 
 load_dotenv()
 
-pc = Pinecone(
-    api_key=os.getenv("PINECONE_API_KEY")
-)
+try:
+    pc = Pinecone(
+        api_key=os.getenv("PINECONE_API_KEY")
+    )
+except Exception:
+    pc = None
 
 INDEX_NAME = "food-ai-index"
+index = None
 
 
-if INDEX_NAME not in pc.list_indexes().names():
+if pc is not None:
+    try:
+        if INDEX_NAME not in pc.list_indexes().names():
+            pc.create_index(
+                name=INDEX_NAME,
+                dimension=1536,
+                metric="cosine",
+                spec={
+                    "serverless": {
+                        "cloud": "aws",
+                        "region": "us-east-1"
+                    }
+                }
+            )
 
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=1536,
-        metric="cosine",
-        spec={
-            "serverless": {
-                "cloud": "aws",
-                "region": "us-east-1"
-            }
-        }
-    )
-
-index = pc.Index(INDEX_NAME)
+        index = pc.Index(INDEX_NAME)
+    except Exception:
+        index = None
 
 
 def _ensure_index():
@@ -76,7 +83,7 @@ def _sanitize_metadata(metadata):
 
 def upsert_vectors(vectors):
     """Upsert a list of tuples: (id, vector, metadata)"""
-    if not vectors:
+    if not vectors or index is None:
         return None
 
     items = []
@@ -91,6 +98,9 @@ def upsert_vectors(vectors):
 
 
 def query_vector(vector, top_k=5, filter=None):
+    if index is None:
+        return {"matches": []}
+
     try:
         res = index.query(vector=vector, top_k=top_k, include_metadata=True, filter=filter)
         return res

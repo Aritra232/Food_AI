@@ -1,121 +1,163 @@
 # Food AI
 
-Food AI is an AI-powered food discovery and ordering assistant built with Python. It combines conversational recommendations, user preference learning, location-aware restaurant search, cart handling, and order workflows into a single experience.
+Food AI is a personalized AI food-ordering assistant. The backend uses MongoDB as
+the source of truth for restaurants, food items, variations, extras, user
+preferences, chat memory, cart sessions, interactions, and final orders.
 
-The project has two main interfaces:
-- a FastAPI backend in [main.py](main.py) that exposes REST endpoints for chat, recommendations, search, onboarding, carts, and restaurant requests
-- a Streamlit frontend in [app_streamlit.py](app_streamlit.py) that provides a chat-style UI for interacting with the backend
+The AI layer does not invent catalog data. It extracts intent and filters from
+natural language, the backend queries MongoDB, safety filters remove unsuitable
+food items, and the AI explains the valid results conversationally.
 
-## Features
+Allergy handling is persistent and safety-focused. When a user says something
+like "I am allergic to peanuts", the AI expands that into hidden safety terms
+such as related ingredient names and menu wording. Those terms are stored in
+`user_preferences.allergy_terms`, and the backend filters matching food items
+before the AI explains recommendations.
 
-- Conversational food assistant with chat history and session memory
-- Personalized food recommendations based on user profile and preferences
-- Allergy and dietary-awareness checks for safer suggestions
-- Location-based restaurant and menu discovery
-- Semantic search support through Pinecone vector search
-- Cart and order-related flows
-- Onboarding profile capture and saved delivery addresses
-- Restaurant request management for missing restaurants or menu items
+## Core Flow
+
+```text
+user message
+-> load persistent user preferences
+-> extract intent, filters, instructions, preference updates
+-> query restaurants and food_items from MongoDB
+-> remove allergy and dietary conflicts
+-> rank valid food items
+-> AI explains the real options
+-> save conversation, interaction, and cart state
+```
+
+## Main Collections
+
+- `restaurants`: restaurant profile, location, delivery fee, availability.
+- `food_items`: real menu food items used for recommendation.
+- `food_item_variations`: sizes or versions for food items.
+- `food_item_extras`: valid add-ons connected to food items.
+- `user_preferences`: long-term personalization and hard allergy restrictions.
+- `ai_conversations`: chat/session records.
+- `ai_messages`: individual user and assistant messages with structured data.
+- `ai_cart_sessions`: active AI-assisted cart while the user is chatting.
+- `user_food_interactions`: recommended, accepted, rejected, ordered, favorited.
+- `orders`: finalized checkout records and order status.
+
+Legacy collections such as `menus`, `conversations`, `chat_sessions`, and `cart`
+are kept readable for compatibility while the app moves to the cleaner model.
 
 ## Tech Stack
 
-- Python 3.10+
-- FastAPI for the backend API
-- Streamlit for the web UI
-- MongoDB for persistence
-- Anthropic / OpenAI-compatible AI services
-- Pinecone for vector embeddings and semantic search
-- Requests and python-dotenv for API integration and environment config
+- Python
+- FastAPI
+- Pydantic
+- MongoDB
+- Anthropic Claude
+- OpenAI key available for future embeddings/search work
+- Streamlit frontend
 
-## Project Structure
+Pinecone is no longer required by the active backend flow.
 
-- [main.py](main.py) - FastAPI app and API endpoints
-- [app_streamlit.py](app_streamlit.py) - Streamlit frontend and UI state handling
-- [service/ai](service/ai) - AI integrations such as chat, embeddings, intent detection, and preference extraction
-- [service/business](service/business) - restaurant, location, cart, and order logic
-- [service/data](service/data) - MongoDB access and profile persistence
-- [service/memory](service/memory) - chat sessions, conversation memory, and option memory
-- [service/recommendation](service/recommendation) - recommendation generation and response formatting
-- [service/state](service/state) - lightweight conversation state tracking
-- [service/vector_db](service/vector_db) - Pinecone vector store integration
+## Running
 
-## Prerequisites
-
-Before running the project, make sure you have:
-
-- Python installed
-- MongoDB running and reachable
-- API credentials for the AI services you want to use
-- Optional: Pinecone account and index access for semantic search
-- Optional: Google Maps API key if you want geocoding/location-based checks
-
-## Environment Variables
-
-Create a file named .env in the project root with values similar to the following:
-
-```env
-MONGO_URL=your_mongodb_connection_string
-CLAUDE_API_KEY=your_claude_api_key
-CLAUDE_MODEL=claude-opus-4-6
-OPENAI_API_KEY=your_openai_key
-PINECONE_API_KEY=your_pinecone_key
-MAPS_API_KEY=your_google_maps_api_key
-```
-
-> The application expects MongoDB to be configured before startup. If the environment values are missing, the app will fail to initialize properly.
-
-## Installation
-
-On Windows PowerShell:
+Install dependencies:
 
 ```powershell
-python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## Running the Application
-
-### 1. Start the backend API
+Start the API:
 
 ```powershell
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+uvicorn main:app --reload --host 127.0.0.1 --port 8001
 ```
 
-### 2. Start the Streamlit UI
-
-In a second terminal:
+Start the Streamlit UI:
 
 ```powershell
 streamlit run app_streamlit.py
 ```
 
-The Streamlit app expects the backend API to be available at http://127.0.0.1:8000.
+## AI Model Settings
 
-## Main API Endpoints
+The chat service uses Claude first by default, then OpenAI as a fallback if
+Claude fails. You can control this from `.env`:
 
-Some of the core endpoints exposed by the backend include:
+```env
+FOOD_AI_PROVIDER=auto
+CLAUDE_MODEL=your_claude_model
+OPENAI_MODEL=your_openai_model
+```
 
-- GET / - health/home endpoint
-- GET /chat-history - fetch chat history and sessions
-- POST /chat - send a chat message to the food assistant
-- GET /recommend-food - return food recommendations
-- GET /available-foods - list nearby available food options
-- GET /search-food - keyword search for food items
-- GET /semantic-search - semantic search using embeddings
-- GET /cart - view the current cart
-- POST /profile/onboarding - save onboarding/profile details
-- POST /profile/address - save or update delivery address
-- POST /add-restaurant - add a restaurant record
-- POST /add-menu - add a menu item
-- POST /restaurant-request - create a restaurant request
+Allowed `FOOD_AI_PROVIDER` values:
 
-## Notes
+- `auto`: try Claude first, then OpenAI.
+- `claude`: prefer Claude.
+- `openai`: prefer OpenAI.
 
-- The app uses MongoDB collections such as conversations, chat_sessions, user_profiles, restaurants, menus, cart, orders, and restaurant_requests.
-- Pinecone integration is used for semantic item lookup and is expected to be configured before semantic search is used.
-- The repo also includes [claude_test.py](claude_test.py), which is a simple Claude API test script for validating API access.
+## Important Endpoints
 
-## License
+Swagger is organized into these simple sections:
 
-This project is intended for local development and demonstration purposes unless otherwise specified by the repository owner.
+- `System`: check if the API is running.
+- `AI Chat`: send messages and load chat history.
+- `Add Data`: add restaurant, food, sizes, extras, or bulk catalog data.
+- `Find Food`: search restaurants, food, sizes, extras, and food options.
+- `User Memory`: save/read allergies, dietary rules, and preferences.
+- `Cart & Orders`: add to cart, save instructions, checkout, and track orders.
+
+Main endpoints:
+
+- `POST /chat`: main AI chat and ordering endpoint.
+- `GET /chat-history`: list and load conversations.
+- `GET /user-preferences`: read long-term preferences.
+- `PATCH /user-preferences`: update preferences and allergies.
+- `POST /restaurants`: add a restaurant to MongoDB.
+- `POST /food-items`: add a food item to MongoDB.
+- `POST /food-item-variations`: add size/version options.
+- `POST /food-item-extras`: add extras connected to a food item.
+- `POST /catalog/import`: add restaurants, food items, sizes, and extras together.
+- `GET /food-items`: search safe food items.
+- `POST /cart/items`: add a food item to an AI cart session.
+- `GET /cart`: view active AI cart session.
+- `POST /checkout`: convert the AI cart session into an order.
+- `GET /orders`: list finalized orders.
+
+Legacy endpoints used by the Streamlit UI still exist, but they are hidden from
+Swagger so the API documentation stays simple.
+
+## Example Catalog Input
+
+For real data entry, add a restaurant first, copy its returned Mongo `_id`, then
+use that value as the food item's `restaurant_id`.
+
+`POST /restaurants`:
+
+```json
+{
+  "name": "Pizza House",
+  "category": "Italian",
+  "description": "Fresh pizza and pasta",
+  "address": "Gulshan, Dhaka",
+  "latitude": 23.8103,
+  "longitude": 90.4125,
+  "delivery_fee": 60,
+  "is_active": true
+}
+```
+
+Copy the returned `_id`, for example `68aad9f351cb98228ad1d95`.
+
+`POST /food-items`:
+
+```json
+{
+  "restaurant_id": "PASTE_RESTAURANT_MONGO_ID_HERE",
+  "name": "Spicy Chicken Pasta",
+  "description": "Creamy pasta with chicken and chili",
+  "category": "Pasta",
+  "base_price": 450,
+  "spice_level": "spicy",
+  "tags": ["pasta", "spicy"],
+  "ingredients": ["pasta", "chicken", "cream", "chili"],
+  "is_available": true
+}
+```

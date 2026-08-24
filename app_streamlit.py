@@ -1,4 +1,5 @@
 import re
+import os
 import streamlit as st
 import requests
 import json
@@ -7,7 +8,7 @@ from uuid import uuid4
 
 # Configuration
 # Use 127.0.0.1 to avoid IPv6/localhost resolving to another local service
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8001")
 
 # Page configuration
 st.set_page_config(

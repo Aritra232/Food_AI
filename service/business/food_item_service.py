@@ -60,6 +60,21 @@ MEAT_TERMS = {
     "meat",
 }
 
+RELATED_ITEM_CATEGORIES = {
+    "dessert",
+    "desserts",
+    "drink",
+    "drinks",
+    "beverage",
+    "beverages",
+    "side",
+    "sides",
+    "add-on",
+    "addon",
+    "add on",
+    "sauce",
+}
+
 
 def _object_id(value):
     try:
@@ -323,6 +338,32 @@ def find_food_items(filters=None, preferences=None, lat=None, lng=None, limit=8,
 
     results.sort(key=lambda item: (-item.get("score", 0), item.get("distance_km", 9999), item.get("base_price", 0)))
     return results[: int(limit or 8)]
+
+
+def find_related_items(restaurant_id, preferences=None, exclude_food_item_ids=None, limit=5):
+    exclude = {str(item) for item in (exclude_food_item_ids or []) if item}
+    results = []
+
+    for item in _catalog_documents(include_legacy=False):
+        if not item or not item.get("is_available"):
+            continue
+        if str(item.get("restaurant_id")) != str(restaurant_id):
+            continue
+        if item.get("food_item_id") in exclude or item.get("_id") in exclude:
+            continue
+        blob = _text_blob(item)
+        category = str(item.get("category") or "").strip().lower()
+        tags = set(_lower_terms(item.get("tags")))
+        if category not in RELATED_ITEM_CATEGORIES and not tags.intersection(RELATED_ITEM_CATEGORIES):
+            if not any(term in blob for term in RELATED_ITEM_CATEGORIES):
+                continue
+        if not is_safe_for_user(item, preferences):
+            continue
+        item["score"] = _score_item(item, {"query": "dessert drink side add-on"}, preferences)
+        results.append(item)
+
+    results.sort(key=lambda item: (-item.get("score", 0), item.get("base_price", 0)))
+    return results[: int(limit or 5)]
 
 
 def get_food_item(food_item_id):

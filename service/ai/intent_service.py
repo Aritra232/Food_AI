@@ -44,38 +44,9 @@ User message:
 
 
 def _detect_intent_fallback(message: str):
-    stripped = message.strip()
-    lower_message = message.lower()
-
-    if stripped.upper() in {"A", "B", "C", "D", "E"}:
-        return "select"
-
-    if any(word in lower_message for word in [
-        "remove", "change", "add more", "extra"
-    ]):
-        return "modify"
-
-    if any(word in lower_message for word in [
-        "allerg", "intolerant", "reaction", "cannot eat", "can't eat"
-    ]):
-        return "chat"
-
-    if any(word in lower_message for word in [
-        "want", "crave", "hungry", "order", "eat"
-    ]):
-        return "order"
-
-    if any(word in lower_message for word in [
-        "option a", "option b", "option c", "option d", "option e",
-        "i choose", "select", "go with", "choose"
-    ]):
-        return "select"
-
-    if any(word in lower_message for word in [
-        "cart", "checkout", "confirm", "place order", "yes", "confirm order"
-    ]):
-        return "checkout"
-
+    # This legacy service is not used by the current FastAPI chat flow. Keep the
+    # fallback conservative so unavailable AI providers do not trigger cart or
+    # order actions from brittle keyword guesses.
     return "chat"
 
 

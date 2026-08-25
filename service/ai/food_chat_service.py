@@ -17,6 +17,7 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI
 
 DEFAULT_INTERPRETATION = {
     "intent": "general_chat",
+    "next_step": "",
     "filters": {
         "query": "",
         "category": "",
@@ -38,17 +39,25 @@ DEFAULT_INTERPRETATION = {
         "special_preferences": [],
     },
     "cart_action": {
+        "operation": "",
         "food_item_id": "",
+        "food_name": "",
         "quantity": 1,
+        "target_quantity": None,
         "variation_id": "",
         "extra_ids": [],
     },
+    "cart_actions": [],
     "special_instructions": "",
 }
 
 ALLOWED_INTENTS = {
     "recommend_food",
     "add_to_cart",
+    "confirm_food",
+    "confirm_addon",
+    "decline_addon",
+    "add_special_instruction",
     "update_cart",
     "checkout",
     "order_status",
@@ -93,6 +102,21 @@ def _normalize_interpretation(parsed, original_message):
         normalized["cart_action"]["quantity"] = max(1, int(normalized["cart_action"].get("quantity") or 1))
     except Exception:
         normalized["cart_action"]["quantity"] = 1
+    actions = normalized.get("cart_actions")
+    normalized["cart_actions"] = actions if isinstance(actions, list) else []
+    cleaned_actions = []
+    for action in normalized["cart_actions"]:
+        if not isinstance(action, dict):
+            continue
+        merged_action = _deep_merge_defaults(action, DEFAULT_INTERPRETATION["cart_action"])
+        try:
+            merged_action["quantity"] = max(1, int(merged_action.get("quantity") or 1))
+        except Exception:
+            merged_action["quantity"] = 1
+        cleaned_actions.append(merged_action)
+    normalized["cart_actions"] = cleaned_actions
+    if not normalized["cart_actions"] and normalized["cart_action"].get("operation"):
+        normalized["cart_actions"] = [normalized["cart_action"]]
     return normalized
 
 
@@ -190,84 +214,32 @@ def _call_text(system_prompt, prompt, max_tokens=900, temperature=0.4):
 
 
 def _fallback_interpret(message):
-    text = (message or "").lower()
-    intent = "general_chat"
-    stripped = text.strip()
-
-    if stripped in {"a", "b", "c", "d", "e"} or re.search(r"\b(option|number)\s*[abcde1-5]\b", stripped):
-        intent = "add_to_cart"
-    if any(word in text for word in ["recommend", "show", "find", "want", "crave", "hungry", "eat"]):
-        intent = "recommend_food"
-    if re.search(r"\b(add|order|choose|select|take)\b", text):
-        intent = "add_to_cart"
-    if any(word in text for word in ["checkout", "place order", "confirm order"]):
-        intent = "checkout"
-    if any(word in text for word in ["where is", "late", "order status", "delivery"]):
-        intent = "order_status"
-    if any(phrase in text for phrase in ["extra ", "no ", "without ", "less spicy", "more spicy", "do not add"]):
-        if intent == "general_chat":
-            intent = "update_cart"
-
-    filters = {"query": message}
-    price_match = re.search(r"(?:under|below|less than|max|maximum)\s*\$?(\d+)", text)
-    if price_match:
-        filters["max_price"] = float(price_match.group(1))
-    for dietary in ["vegetarian", "vegan", "halal", "gluten-free", "dairy-free", "keto"]:
-        if dietary in text:
-            filters.setdefault("dietary", []).append(dietary)
-    for spice in ["mild", "medium", "spicy", "hot"]:
-        if spice in text:
-            filters["spice_level"] = spice
-
-    number_words = {
-        "one": 1,
-        "two": 2,
-        "three": 3,
-        "four": 4,
-        "five": 5,
-        "six": 6,
-        "seven": 7,
-        "eight": 8,
-        "nine": 9,
-        "ten": 10,
-    }
-    quantity = 1
-    quantity_match = re.search(r"\b(\d+)\b", text)
-    if quantity_match:
-        quantity = int(quantity_match.group(1))
-    else:
-        for word, value in number_words.items():
-            if re.search(rf"\b{word}\b", text):
-                quantity = value
-                break
-
-    preference_updates = {}
-    allergy_match = re.search(r"allerg(?:ic|y|ies)?\s*(?:to)?\s+([a-zA-Z, ]+)", text)
-    if allergy_match:
-        preference_updates["allergies"] = [item.strip() for item in allergy_match.group(1).split(",") if item.strip()]
-    remove_allergy_match = re.search(r"(?:remove|delete|forget|clear)\s+(?:my\s+)?([a-zA-Z, ]+)\s+allerg", text)
-    if remove_allergy_match:
-        preference_updates["remove_allergies"] = [
-            item.strip()
-            for item in remove_allergy_match.group(1).split(",")
-            if item.strip()
-        ]
-
+    # This is intentionally conservative. Natural-language understanding belongs
+    # to the AI model; when no model is available we avoid mutating preferences
+    # or cart state from brittle keyword guesses.
     return {
-        "intent": intent,
-        "filters": filters,
-        "preference_updates": preference_updates,
-        "cart_action": {"quantity": quantity},
-        "special_instructions": message if intent == "update_cart" else "",
+        "intent": "general_chat",
+        "filters": {"query": message},
+        "preference_updates": {},
+        "cart_action": {
+            "operation": "",
+            "food_name": "",
+            "quantity": 1,
+            "target_quantity": None,
+        },
+        "cart_actions": [],
+        "next_step": "",
+        "special_instructions": "",
     }
 
 
-def interpret_message(message, user_preferences=None, recent_messages=None):
+def interpret_message(message, user_preferences=None, recent_messages=None, cart=None, current_step=None):
     system_prompt = """You convert food-ordering chat into safe structured JSON.
 
 Return ONLY valid JSON with this shape:
 {
-  "intent": "recommend_food|add_to_cart|update_cart|checkout|order_status|general_chat",
+  "intent": "recommend_food|confirm_food|confirm_addon|decline_addon|add_special_instruction|update_cart|checkout|order_status|general_chat",
+  "next_step": "",
   "filters": {
     "query": "",
     "category": "",
@@ -289,11 +261,25 @@ Return ONLY valid JSON with this shape:
     "special_preferences": []
   },
   "cart_action": {
+    "operation": "add|remove|set_quantity|increase_quantity|decrease_quantity|",
     "food_item_id": "",
+    "food_name": "",
     "quantity": 1,
+    "target_quantity": null,
     "variation_id": "",
     "extra_ids": []
   },
+  "cart_actions": [
+    {
+      "operation": "add|remove|set_quantity|increase_quantity|decrease_quantity",
+      "food_item_id": "",
+      "food_name": "",
+      "quantity": 1,
+      "target_quantity": null,
+      "variation_id": "",
+      "extra_ids": []
+    }
+  ],
   "special_instructions": ""
 }
 
@@ -302,19 +288,52 @@ Rules:
 - If the user explicitly removes an allergy, put it in remove_allergies.
 - Do not invent food ids, restaurant ids, extras, prices, or availability.
 - If the user asks for food, set intent recommend_food and put searchable words in filters.query.
-- Preserve special instructions like no onions, extra sauce, less spicy."""
+- Use semantic meaning and conversation context, not exact phrase matching.
+- If the user accepts a recommended main food, set intent confirm_food.
+- If the user accepts a suggested dessert, drink, side, sauce, extra, or add-on, set intent confirm_addon.
+- If the user declines suggested dessert, drink, side, sauce, extra, or add-on, set intent decline_addon and next_step special_instruction.
+- If the user requests an additional cart item after cart/instruction flow, set intent update_cart and cart_action.operation add or increase_quantity.
+- If the user requests that a cart item be removed, set intent update_cart and cart_action.operation remove.
+- If the user requests a quantity change, set intent update_cart and cart_action.operation set_quantity. Put the final amount in target_quantity.
+- If one message contains multiple cart changes or multiple foods, return every requested change in cart_actions. Also set cart_action to the first action for compatibility.
+- Include food_name when the user mentions a food by name or clearly refers to a specific cart/recommended item.
+- Include quantity when the user states how many items to add/remove, and target_quantity when they state the final desired quantity.
+- Multiple restaurants are allowed only when the backend can verify they are near the user's location; still extract every food request and let the backend validate restaurant distance.
+- If the user gives customization notes about ingredients, spice level, temperature, preparation, substitutions, exclusions, packaging, or delivery handling, set intent add_special_instruction and preserve the user's intended meaning in special_instructions.
+- If the message is ambiguous, choose general_chat instead of guessing a cart mutation."""
 
     prompt = {
         "user_message": message,
         "known_user_preferences": user_preferences or {},
         "recent_messages": recent_messages or [],
+        "current_cart": cart or {},
+        "current_step": current_step or "",
+        "context_rules": [
+            "If current_step is suggesting_addons and user accepts, use confirm_addon.",
+            "If current_step is suggesting_addons and user declines, use decline_addon.",
+            "If current_step is awaiting_instruction and user gives notes, use add_special_instruction.",
+            "Use recent assistant recommendations and current cart to resolve references like this one, the first one, another one, or the dessert.",
+            "For cart changes, return the user's intended operation in cart_action/cart_actions but do not invent ids.",
+        ],
     }
 
     parsed = _call_json(system_prompt, prompt, max_tokens=900)
     if isinstance(parsed, dict):
-        return _normalize_interpretation(parsed, message)
+        normalized = _normalize_interpretation(parsed, message)
+        if current_step == "suggesting_addons" and normalized["intent"] == "confirm_food":
+            normalized["intent"] = "confirm_addon"
+        if current_step == "awaiting_instruction" and normalized["intent"] == "general_chat":
+            normalized["intent"] = "add_special_instruction"
+            normalized["special_instructions"] = normalized.get("special_instructions") or message
+        return normalized
 
-    return _normalize_interpretation(_fallback_interpret(message), message)
+    fallback = _normalize_interpretation(_fallback_interpret(message), message)
+    if current_step == "suggesting_addons" and fallback["intent"] == "confirm_food":
+        fallback["intent"] = "confirm_addon"
+    if current_step == "awaiting_instruction" and fallback["intent"] == "general_chat":
+        fallback["intent"] = "add_special_instruction"
+        fallback["special_instructions"] = message
+    return fallback
 
 
 def explain_recommendations(message, recommendations, user_preferences=None):

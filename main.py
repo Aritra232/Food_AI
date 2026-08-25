@@ -13,6 +13,9 @@ from service.ai.food_chat_service import (
 from service.business.cart_session_service import (
     add_item_to_cart_session,
     get_cart_session,
+    remove_cart_item,
+    update_cart_step,
+    update_cart_item_quantity,
     update_cart_instructions,
 )
 from service.business.final_order_service import (
@@ -25,6 +28,7 @@ from service.business.final_order_service import (
 from service.business.food_item_service import (
     create_food_item,
     find_food_items,
+    find_related_items,
     get_food_item,
     get_food_item_options,
 )
@@ -147,13 +151,22 @@ def _latest_recommendations(messages):
     return []
 
 
-def _resolve_selected_food_id(interpretation, message, recent_messages):
+def _latest_structured_list(messages, key):
+    for message in reversed(messages or []):
+        data = message.get("structured_data") or {}
+        values = data.get(key) or []
+        if values:
+            return values
+    return []
+
+
+def _resolve_selected_food_id(interpretation, message, recent_messages, candidates=None):
     cart_action = interpretation.get("cart_action") or {}
     if cart_action.get("food_item_id"):
         return cart_action.get("food_item_id")
 
     text = (message or "").strip().lower()
-    recommendations = _latest_recommendations(recent_messages)
+    recommendations = candidates or _latest_recommendations(recent_messages)
     if not recommendations:
         return None
 
@@ -179,6 +192,113 @@ def _resolve_selected_food_id(interpretation, message, recent_messages):
         if name and (name in text or text in name):
             return item.get("food_item_id")
     return None
+
+
+def _cart_food_ids(cart):
+    return [
+        item.get("food_item_id")
+        for item in (cart or {}).get("items", [])
+        if item.get("food_item_id")
+    ]
+
+
+def _resolve_cart_item_id(cart, food_name=None):
+    if not food_name:
+        items = (cart or {}).get("items", [])
+        if len(items) == 1:
+            return items[0].get("food_item_id")
+        return None
+
+    wanted = str(food_name or "").strip().lower()
+    for item in (cart or {}).get("items", []):
+        current = str(item.get("food_item_name") or item.get("food_name") or "").strip().lower()
+        if wanted and (wanted == current or wanted in current or current in wanted):
+            return item.get("food_item_id")
+    return None
+
+
+def _resolve_food_by_name(food_name, cart, preferences, lat=None, lng=None, allow_cross_restaurant=False):
+    if not food_name:
+        return None
+    filters = {"query": food_name}
+    if cart and cart.get("restaurant_id") and not allow_cross_restaurant:
+        filters["restaurant_id"] = cart.get("restaurant_id")
+    matches = find_food_items(filters, preferences, lat=lat, lng=lng, limit=5)
+    if not matches:
+        return None
+
+    wanted = str(food_name or "").strip().lower()
+    for item in matches:
+        name = str(item.get("name") or item.get("food_name") or "").strip().lower()
+        if wanted and (wanted == name or wanted in name or name in wanted):
+            return item
+    return matches[0]
+
+
+def _interpretation_actions(interpretation):
+    actions = interpretation.get("cart_actions") or []
+    actions = [action for action in actions if isinstance(action, dict)]
+    if actions:
+        return actions
+    action = interpretation.get("cart_action") or {}
+    return [action] if action.get("operation") else []
+
+
+def _action_quantity(action, key="quantity", default=1):
+    try:
+        return max(1, int(action.get(key) or default))
+    except Exception:
+        return default
+
+
+def _build_instruction_prompt(user_id, conversation_id, message_prefix=""):
+    response_text = (
+        f"{message_prefix}\n\n" if message_prefix else ""
+    ) + "Add any special requests or dietary notes below to customize your order."
+    cart = update_cart_step(user_id, conversation_id, current_step="awaiting_instruction")
+    return response_text, cart
+
+
+def _suggest_related_after_cart_add(user_id, conversation_id, cart, preferences, prefix):
+    related = find_related_items(
+        cart.get("restaurant_id"),
+        preferences=preferences,
+        exclude_food_item_ids=_cart_food_ids(cart),
+        limit=5,
+    )
+    if related:
+        update_cart_step(
+            user_id,
+            conversation_id,
+            current_step="suggesting_addons",
+            addon_suggestions=related,
+        )
+        response_text = explain_recommendations(
+            "Suggest dessert, drinks, sides, or add-ons for this order.",
+            related,
+            preferences,
+        )
+        return {
+            "message": f"{prefix}\n\n{response_text}",
+            "next_step": "suggest_addons",
+            "state": "suggesting_addons",
+            "suggestions": related,
+            "show_instruction_card": False,
+        }
+
+    response_text, updated_cart = _build_instruction_prompt(
+        user_id,
+        conversation_id,
+        message_prefix=prefix,
+    )
+    return {
+        "message": response_text,
+        "next_step": "special_instruction",
+        "state": "awaiting_instruction",
+        "suggestions": [],
+        "cart": updated_cart,
+        "show_instruction_card": True,
+    }
 
 
 def _message_text(message):
@@ -381,8 +501,16 @@ def chat(
     conversation = get_or_create_conversation(user_id, conversation_id or chat_session_id, first_message=message)
     conversation_id = conversation["_id"]
     preferences = get_user_preferences(user_id)
+    current_cart = get_cart_session(user_id, conversation_id)
+    current_step = current_cart.get("current_step", "")
     recent_messages = get_messages(conversation_id, user_id, limit=30)
-    interpretation = interpret_message(message, preferences, recent_messages)
+    interpretation = interpret_message(
+        message,
+        preferences,
+        recent_messages,
+        cart=current_cart,
+        current_step=current_step,
+    )
     preference_updates = interpretation.get("preference_updates") or {}
     if any(value for value in preference_updates.values()):
         preferences = update_user_preferences(user_id, preference_updates)
@@ -424,10 +552,21 @@ def chat(
             "recommendations": recommendations,
         }
 
-    if intent == "add_to_cart":
-        food_item_id = _resolve_selected_food_id(interpretation, message, recent_messages)
+    if intent in {"add_to_cart", "confirm_food", "confirm_addon"}:
+        addon_candidates = _latest_structured_list(recent_messages, "addon_suggestions")
+        candidates = addon_candidates if intent == "confirm_addon" or current_step == "suggesting_addons" else None
+        food_item_id = _resolve_selected_food_id(interpretation, message, recent_messages, candidates=candidates)
         if not food_item_id:
             response_text = "Which food item would you like to add? You can choose by option number or food name."
+            add_message(user_id, conversation_id, "assistant", response_text, intent=intent)
+            return {
+                "intent": intent,
+                "state": current_step or "cart",
+                "conversation_id": conversation_id,
+                "chat_session_id": conversation_id,
+                "message": response_text,
+                "cart": get_cart_session(user_id, conversation_id),
+            }
         else:
             action = interpretation.get("cart_action") or {}
             cart = add_item_to_cart_session(
@@ -438,19 +577,61 @@ def chat(
                 variation_id=action.get("variation_id") or None,
                 extra_ids=action.get("extra_ids") or [],
                 special_instructions=interpretation.get("special_instructions") or "",
+                allow_cross_restaurant=lat is not None and lng is not None,
+                user_lat=lat,
+                user_lng=lng,
             )
             if cart and cart.get("error"):
                 response_text = cart["error"]
+                add_message(user_id, conversation_id, "assistant", response_text, intent=intent)
+                return {
+                    "intent": intent,
+                    "state": "cart",
+                    "conversation_id": conversation_id,
+                    "chat_session_id": conversation_id,
+                    "message": response_text,
+                    "cart": get_cart_session(user_id, conversation_id),
+                }
             else:
                 food = get_food_item(food_item_id)
-                response_text = f"Added {food.get('name') if food else 'that food item'} to your cart."
-        add_message(user_id, conversation_id, "assistant", response_text, intent="add_to_cart")
+                prefix = f"Added {food.get('name') if food else 'that food item'} to your cart."
+                if intent == "confirm_addon" or current_step == "suggesting_addons":
+                    response_text, updated_cart = _build_instruction_prompt(
+                        user_id,
+                        conversation_id,
+                        message_prefix=prefix,
+                    )
+                    followup = {
+                        "message": response_text,
+                        "next_step": "special_instruction",
+                        "state": "awaiting_instruction",
+                        "suggestions": [],
+                        "cart": updated_cart,
+                        "show_instruction_card": True,
+                    }
+                else:
+                    followup = _suggest_related_after_cart_add(user_id, conversation_id, cart, preferences, prefix)
+                response_text = followup["message"]
+        add_message(
+            user_id,
+            conversation_id,
+            "assistant",
+            response_text,
+            intent=intent,
+            structured_data={
+                "addon_suggestions": followup.get("suggestions", []) if "followup" in locals() else [],
+                "next_step": followup.get("next_step") if "followup" in locals() else "",
+            },
+        )
         return {
             "intent": intent,
-            "state": "cart",
+            "state": followup.get("state", "cart") if "followup" in locals() else "cart",
+            "next_step": followup.get("next_step", "") if "followup" in locals() else "",
             "conversation_id": conversation_id,
             "chat_session_id": conversation_id,
             "message": response_text,
+            "suggestions": followup.get("suggestions", []) if "followup" in locals() else [],
+            "show_instruction_card": followup.get("show_instruction_card", False) if "followup" in locals() else False,
             "cart": get_cart_session(user_id, conversation_id),
         }
 
@@ -467,7 +648,212 @@ def chat(
             "order": order,
         }
 
+    if intent == "decline_addon":
+        response_text, cart = _build_instruction_prompt(
+            user_id,
+            conversation_id,
+            message_prefix="No problem, I will skip dessert or add-ons.",
+        )
+        add_message(
+            user_id,
+            conversation_id,
+            "assistant",
+            response_text,
+            intent="decline_addon",
+            structured_data={"next_step": "special_instruction"},
+        )
+        return {
+            "intent": intent,
+            "state": "awaiting_instruction",
+            "next_step": "special_instruction",
+            "conversation_id": conversation_id,
+            "chat_session_id": conversation_id,
+            "message": response_text,
+            "show_instruction_card": True,
+            "cart": cart,
+        }
+
     if intent == "update_cart":
+        actions = _interpretation_actions(interpretation)
+        action = actions[0] if actions else {}
+        operation = str(action.get("operation") or "").strip().lower()
+        food_name = action.get("food_name") or ""
+        food_item_id = action.get("food_item_id") or _resolve_cart_item_id(current_cart, food_name=food_name)
+        quantity = _action_quantity(action)
+        target_quantity = action.get("target_quantity")
+
+        if len(actions) > 1:
+            added_names = []
+            updated_names = []
+            errors = []
+            cart = get_cart_session(user_id, conversation_id)
+            for action in actions:
+                operation = str(action.get("operation") or "").strip().lower()
+                food_name = action.get("food_name") or ""
+                food_item_id = action.get("food_item_id") or _resolve_cart_item_id(cart, food_name=food_name)
+                quantity = _action_quantity(action)
+                target_quantity = action.get("target_quantity")
+
+                if operation == "add":
+                    target_food = get_food_item(food_item_id) if food_item_id else None
+                    if not target_food and food_name:
+                        target_food = _resolve_food_by_name(
+                            food_name,
+                            cart,
+                            preferences,
+                            lat=lat,
+                            lng=lng,
+                            allow_cross_restaurant=lat is not None and lng is not None,
+                        )
+                    if not target_food:
+                        errors.append(f"I could not find {food_name or 'one requested food item'} from nearby available restaurants.")
+                        continue
+                    cart = add_item_to_cart_session(
+                        user_id,
+                        conversation_id,
+                        target_food.get("food_item_id"),
+                        quantity=quantity,
+                        variation_id=action.get("variation_id") or None,
+                        extra_ids=action.get("extra_ids") or [],
+                        special_instructions=interpretation.get("special_instructions") or "",
+                        allow_cross_restaurant=lat is not None and lng is not None,
+                        user_lat=lat,
+                        user_lng=lng,
+                    )
+                    if cart and cart.get("error"):
+                        errors.append(cart["error"])
+                        cart = get_cart_session(user_id, conversation_id)
+                    else:
+                        added_names.append(target_food.get("name"))
+                        cart = update_cart_step(user_id, conversation_id, current_step="ready_for_checkout")
+                    continue
+
+                if operation in {"remove", "delete"}:
+                    cart = remove_cart_item(
+                        user_id,
+                        conversation_id,
+                        food_item_id=food_item_id,
+                        food_name=food_name,
+                        quantity=quantity,
+                    )
+                    if cart.get("error"):
+                        errors.append(cart["error"])
+                    else:
+                        updated_names.append(food_name or "cart item")
+                    continue
+
+                if operation in {"set_quantity", "increase_quantity", "decrease_quantity"}:
+                    delta = None
+                    final_quantity = target_quantity
+                    if operation == "increase_quantity":
+                        delta = quantity
+                    elif operation == "decrease_quantity":
+                        delta = -quantity
+                    cart = update_cart_item_quantity(
+                        user_id,
+                        conversation_id,
+                        food_item_id=food_item_id,
+                        food_name=food_name,
+                        quantity=final_quantity,
+                        delta=delta,
+                    )
+                    if cart.get("error"):
+                        errors.append(cart["error"])
+                    else:
+                        updated_names.append(food_name or "cart item")
+
+            cart = get_cart_session(user_id, conversation_id)
+            response_parts = []
+            if added_names:
+                response_parts.append("Added " + ", ".join(added_names) + " to your cart.")
+            if updated_names:
+                response_parts.append("Updated " + ", ".join(updated_names) + ".")
+            if errors:
+                response_parts.append(" ".join(errors))
+            response_text = " ".join(response_parts) or "I could not update the cart from that request."
+        elif operation in {"remove", "delete"}:
+            cart = remove_cart_item(
+                user_id,
+                conversation_id,
+                food_item_id=food_item_id,
+                food_name=food_name,
+                quantity=quantity,
+            )
+            response_text = cart.get("error") or "Updated your cart."
+        elif operation in {"set_quantity", "increase_quantity", "decrease_quantity"}:
+            delta = None
+            final_quantity = target_quantity
+            if operation == "increase_quantity":
+                delta = quantity
+            elif operation == "decrease_quantity":
+                delta = -quantity
+            cart = update_cart_item_quantity(
+                user_id,
+                conversation_id,
+                food_item_id=food_item_id,
+                food_name=food_name,
+                quantity=final_quantity,
+                delta=delta,
+            )
+            response_text = cart.get("error") or "Updated your cart quantity."
+        elif operation == "add":
+            target_food = None
+            if food_item_id:
+                target_food = get_food_item(food_item_id)
+            if not target_food and food_name:
+                target_food = _resolve_food_by_name(
+                    food_name,
+                    current_cart,
+                    preferences,
+                    lat=lat,
+                    lng=lng,
+                    allow_cross_restaurant=lat is not None and lng is not None,
+                )
+            if target_food:
+                cart = add_item_to_cart_session(
+                    user_id,
+                    conversation_id,
+                    target_food.get("food_item_id"),
+                    quantity=quantity,
+                    variation_id=action.get("variation_id") or None,
+                    extra_ids=action.get("extra_ids") or [],
+                    special_instructions=interpretation.get("special_instructions") or "",
+                    allow_cross_restaurant=lat is not None and lng is not None,
+                    user_lat=lat,
+                    user_lng=lng,
+                )
+                if cart and cart.get("error"):
+                    response_text = cart["error"]
+                else:
+                    cart = update_cart_step(user_id, conversation_id, current_step="ready_for_checkout")
+                    response_text = f"Added {target_food.get('name')} to your cart."
+            else:
+                cart = get_cart_session(user_id, conversation_id)
+                response_text = "I could not find that food item from the current restaurant menu."
+        else:
+            instruction = interpretation.get("special_instructions") or message
+            cart = update_cart_instructions(user_id, conversation_id, instruction)
+            response_text = "Got it. I saved that instruction with your cart." if cart.get("items") else "I saved the note, but your cart is still empty. Add a food item first when you are ready."
+
+        add_message(
+            user_id,
+            conversation_id,
+            "assistant",
+            response_text,
+            intent="update_cart",
+            structured_data={"cart": cart, "cart_action": action, "cart_actions": actions},
+        )
+        return {
+            "intent": intent,
+            "state": "ready_for_checkout",
+            "next_step": "checkout",
+            "conversation_id": conversation_id,
+            "chat_session_id": conversation_id,
+            "message": response_text,
+            "cart": cart,
+        }
+
+    if intent == "add_special_instruction":
         instruction = interpretation.get("special_instructions") or message
         cart = update_cart_instructions(user_id, conversation_id, instruction)
         if cart.get("items"):
@@ -479,12 +865,13 @@ def chat(
             conversation_id,
             "assistant",
             response_text,
-            intent="update_cart",
+            intent=intent,
             structured_data={"cart": cart, "special_instructions": instruction},
         )
         return {
             "intent": intent,
-            "state": "cart",
+            "state": "ready_for_checkout",
+            "next_step": "checkout",
             "conversation_id": conversation_id,
             "chat_session_id": conversation_id,
             "message": response_text,

@@ -21,6 +21,20 @@ DEFAULT_PREFERENCES = {
 }
 
 
+ONBOARDING_BUDGETS = {
+    "budget_friendly": (0, 10),
+    "budget friendly": (0, 10),
+    "low": (0, 10),
+    "casual_dining": (10, 25),
+    "casual dining": (10, 25),
+    "medium": (10, 25),
+    "fine_dining": (25, 50),
+    "fine dining": (25, 50),
+    "high": (25, 50),
+    "premium": (50, None),
+}
+
+
 def _normalize_list(value):
     if not value:
         return []
@@ -39,6 +53,23 @@ def _unique(values):
         seen.add(key)
         result.append(value)
     return result
+
+
+def _normalize_budget_range(value):
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _normalize_address(address):
+    address = address or {}
+    if not isinstance(address, dict):
+        return {}
+    return {
+        "address_type": str(address.get("address_type") or "Home").strip() or "Home",
+        "street_address": str(address.get("street_address") or "").strip(),
+        "city": str(address.get("city") or "").strip(),
+        "zip_code": str(address.get("zip_code") or "").strip(),
+        "leave_at_door": bool(address.get("leave_at_door", False)),
+    }
 
 
 def _legacy_preferences(user_id):
@@ -141,4 +172,57 @@ def update_user_preferences(user_id, updates):
         update_doc["$addToSet"] = add_to_set
 
     user_preference_collection.update_one({"user_id": user_id}, update_doc, upsert=True)
+    return get_user_preferences(user_id)
+
+
+def save_onboarding_preferences(user_id, onboarding_data):
+    onboarding_data = onboarding_data or {}
+    get_user_preferences(user_id)
+
+    budget_range = _normalize_budget_range(onboarding_data.get("budget_range"))
+    budget_min = onboarding_data.get("typical_min_budget")
+    budget_max = onboarding_data.get("typical_max_budget")
+    if budget_range and (budget_min is None and budget_max is None):
+        budget_min, budget_max = ONBOARDING_BUDGETS.get(budget_range, (None, None))
+
+    preference_updates = {
+        "preferred_cuisines": onboarding_data.get("preferred_cuisines", []),
+        "dietary_preferences": _unique(
+            _normalize_list(onboarding_data.get("dietary_preferences"))
+            + _normalize_list(onboarding_data.get("dietary_restrictions"))
+        ),
+        "preferred_spice_levels": onboarding_data.get("preferred_spice_levels", []),
+        "typical_min_budget": budget_min,
+        "typical_max_budget": budget_max,
+        "special_preferences": onboarding_data.get("special_preferences", []),
+    }
+    if onboarding_data.get("dietary_note"):
+        preference_updates["special_preferences"] = _unique(
+            _normalize_list(preference_updates["special_preferences"])
+            + [onboarding_data.get("dietary_note")]
+        )
+
+    update_user_preferences(user_id, preference_updates)
+
+    completed = bool(onboarding_data.get("onboarding_completed", True))
+    set_values = {
+        "budget_range": budget_range,
+        "delivery_address": _normalize_address(onboarding_data.get("delivery_address")),
+        "order_frequency": str(onboarding_data.get("order_frequency") or "").strip(),
+        "order_time": str(onboarding_data.get("order_time") or "").strip(),
+        "preferred_meal_time": _normalize_list(onboarding_data.get("preferred_meal_time")),
+        "onboarding_completed": completed,
+        "updated_at": datetime.utcnow(),
+    }
+    if budget_range or budget_min is not None or budget_max is not None:
+        set_values["typical_min_budget"] = budget_min
+        set_values["typical_max_budget"] = budget_max
+    if completed:
+        set_values["onboarding_completed_at"] = datetime.utcnow()
+
+    user_preference_collection.update_one(
+        {"user_id": user_id},
+        {"$set": set_values},
+        upsert=True,
+    )
     return get_user_preferences(user_id)

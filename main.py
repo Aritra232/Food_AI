@@ -38,7 +38,11 @@ from service.data.database_service import (
     restaurant_collection,
 )
 from service.data.mongo_utils import serialize_mongo
-from service.data.preference_memory_service import get_user_preferences, update_user_preferences
+from service.data.preference_memory_service import (
+    get_user_preferences,
+    save_onboarding_preferences,
+    update_user_preferences,
+)
 from service.memory.ai_conversation_service import (
     add_message,
     get_messages,
@@ -123,6 +127,24 @@ class CheckoutRequest(BaseModel):
     user_id: str
     conversation_id: Optional[str] = None
     delivery_address: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OnboardingPreferencesRequest(BaseModel):
+    user_id: str
+    preferred_cuisines: List[str] = Field(default_factory=list)
+    dietary_preferences: List[str] = Field(default_factory=list)
+    dietary_restrictions: List[str] = Field(default_factory=list)
+    preferred_spice_levels: List[str] = Field(default_factory=list)
+    budget_range: str = ""
+    typical_min_budget: Optional[float] = None
+    typical_max_budget: Optional[float] = None
+    delivery_address: Dict[str, Any] = Field(default_factory=dict)
+    order_frequency: str = ""
+    order_time: str = ""
+    preferred_meal_time: List[str] = Field(default_factory=list)
+    special_preferences: List[str] = Field(default_factory=list)
+    dietary_note: str = ""
+    onboarding_completed: bool = True
 
 
 class CatalogImportRequest(BaseModel):
@@ -415,6 +437,15 @@ def read_user_preferences(user_id: str):
 @app.patch("/user-preferences", tags=["User Memory"], summary="Update User Memory")
 def patch_user_preferences(user_id: str, updates: Dict[str, Any] = Body(default_factory=dict)):
     return update_user_preferences(user_id, updates)
+
+
+@app.post("/onboarding/preferences", tags=["User Memory"], summary="Save Onboarding Preferences")
+def post_onboarding_preferences(data: OnboardingPreferencesRequest):
+    return {
+        "message": "Onboarding preferences saved",
+        "user_id": data.user_id,
+        "preferences": save_onboarding_preferences(data.user_id, _model_dump(data)),
+    }
 
 
 @app.get("/user-profile", include_in_schema=False)

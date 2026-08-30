@@ -1,4 +1,4 @@
-from service.database_service import session_collection
+from service.data.database_service import session_collection
 
 
 def save_session(user_id, data):
